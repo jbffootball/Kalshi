@@ -107,7 +107,7 @@ def get_recent_settled_markets():
     # IMPORTANT: Recent settlements belong on the live /markets endpoint.
     # /historical/markets is only for markets older than Kalshi's historical cutoff.
     # Restrict to the last 24 hours so a stale historical page can never drive the streak.
-    since_ts = int((utc_now() - timedelta(hours=24)).timestamp())
+    since_ts = int((utc_now() - dt.timedelta(hours=24)).timestamp())
     data = get_json(
         "/markets",
         {
