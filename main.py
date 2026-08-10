@@ -331,11 +331,11 @@ def main():
 
             print(f"QUALIFIED: {side.upper()} at {ask}c")
             if MODE == "paper":
-                print("PAPER SIGNAL ONLY — no order sent.")
+                print("PAPER SIGNAL ONLY â no order sent.")
                 log_signal(ticker, last_result, streak, side, ask, age)
                 traded_markets.add(ticker)
             elif not PLACE_ORDERS:
-                print("DEMO signal only — PLACE_DEMO_ORDERS=false.")
+                print("DEMO signal only â PLACE_DEMO_ORDERS=false.")
                 log_signal(ticker, last_result, streak, side, ask, age)
                 traded_markets.add(ticker)
             else:
@@ -352,5 +352,8 @@ def main():
         except Exception as e:
             print("ERROR:", repr(e))
             time.sleep(POLL_SECONDS)
+
+
 if __name__ == "__main__":
     main()
+
