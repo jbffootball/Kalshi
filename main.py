@@ -115,12 +115,35 @@ def get_open_markets():
     return data.get("markets", [])
 
 
+def last_five_settled(markets):
+    """Return only the five most recent settled markets, oldest -> newest."""
+    return markets[-5:]
+
+
+def print_last_five(markets):
+    recent = last_five_settled(markets)
+    print("LAST 5 SETTLED (oldest -> newest):")
+    if not recent:
+        print("  none")
+        return
+    for m in recent:
+        close_time = m.get("close_time", "?")
+        ticker = m.get("ticker", "?")
+        result = (m.get("result") or "?").upper()
+        print(f"  {close_time} | {ticker} | {result}")
+    sequence = " | ".join((m.get("result") or "?").upper() for m in recent)
+    print(f"  SEQUENCE: {sequence}")
+
+
 def calculate_streak(markets):
-    if not markets:
+    # The streak calculation intentionally looks back at only
+    # the five most recent settled BTC 15-minute markets.
+    recent = last_five_settled(markets)
+    if not recent:
         return None, 0
-    latest = markets[-1]["result"]
+    latest = recent[-1]["result"]
     count = 0
-    for m in reversed(markets):
+    for m in reversed(recent):
         if m.get("result") == latest:
             count += 1
         else:
@@ -307,7 +330,9 @@ def main():
             settled = get_recent_settled_markets()
             settle_pending_trades(settled)
 
+            print_last_five(settled)
             last_result, streak = calculate_streak(settled)
+            print(f"CALCULATED: last={last_result} streak={streak}")
             print(f"{utc_now().isoformat(timespec='seconds')} last={last_result} streak={streak}")
             if streak < STREAK_TRIGGER:
                 time.sleep(POLL_SECONDS)
@@ -356,4 +381,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
