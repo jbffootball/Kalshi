@@ -104,9 +104,27 @@ def get_json(path, params=None):
 
 
 def get_recent_settled_markets():
-    data = get_json("/historical/markets", {"series_ticker": SERIES, "limit": 1000})
+    # IMPORTANT: Recent settlements belong on the live /markets endpoint.
+    # /historical/markets is only for markets older than Kalshi's historical cutoff.
+    # Restrict to the last 24 hours so a stale historical page can never drive the streak.
+    since_ts = int((utc_now() - timedelta(hours=24)).timestamp())
+    data = get_json(
+        "/markets",
+        {
+            "series_ticker": SERIES,
+            "status": "settled",
+            "min_settled_ts": since_ts,
+            "limit": 1000,
+        },
+    )
     markets = [m for m in data.get("markets", []) if m.get("result") in {"yes", "no"}]
-    markets.sort(key=lambda m: m.get("close_time", ""))
+
+    # settlement_ts is the preferred chronology for settled markets. Fall back to
+    # close_time only if settlement_ts is absent.
+    def settlement_sort_key(m):
+        return m.get("settlement_ts") or m.get("close_time") or ""
+
+    markets.sort(key=settlement_sort_key)
     return markets
 
 
