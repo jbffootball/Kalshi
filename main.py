@@ -3,6 +3,7 @@ import time
 import uuid
 import base64
 import csv
+import json
 import re
 import datetime as dt
 from urllib.parse import urlparse
@@ -40,6 +41,7 @@ ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
 RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "1"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 MAX_CLOSE_CAPTURE_LAG_SECONDS = float(os.getenv("MAX_CLOSE_CAPTURE_LAG_SECONDS", "3"))
+DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() == "true"
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
 # RAILWAY_VOLUME_MOUNT_PATH automatically. Otherwise, fall back to ./data.
@@ -468,8 +470,29 @@ def fetch_prepared_kalshi_close(prepared):
             continue
 
         live_data = payload.get("live_data", payload)
+
+        if DEBUG_LIVE_DATA:
+            try:
+                print(
+                    "LIVE DATA RAW: "
+                    + json.dumps(
+                        {
+                            "milestone_id": milestone_id,
+                            "live_data": live_data,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception as exc:
+                print(f"LIVE DATA RAW LOG ERROR: {exc!r}")
+
         price, path = extract_btc_price_from_live_data(live_data, start_btc)
         if price is not None:
+            print(
+                f"LIVE DATA EXTRACTED: milestone={milestone_id} "
+                f"path={path} value={format_decimal(price)}"
+            )
             return price, "kalshi_live_data_cached_milestone", path, milestone_id
 
     return None, "", "", ""
@@ -1284,6 +1307,7 @@ def main():
     print("OUTCOME SOURCE=Kalshi displayed BTC start/target vs Kalshi live BTC at close")
     print("OFFICIAL DETERMINATION=not used for trading decision")
     print("BOUNDARY CAPTURE=pre-cache open session, then read Kalshi live_data at close")
+    print(f"DEBUG_LIVE_DATA={DEBUG_LIVE_DATA}")
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
 
