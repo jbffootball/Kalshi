@@ -91,6 +91,26 @@ def auth_headers(method, path):
     }
 
 
+def authenticated_request(method, path, json_body=None):
+    """Authenticated Kalshi Demo request using the bot's existing auth_headers()."""
+    method = method.upper()
+    headers = auth_headers(method, path)
+    url = BASE_URL + path
+
+    if method == "GET":
+        r = requests.get(url, headers=headers, timeout=15)
+    elif method == "POST":
+        r = requests.post(url, headers=headers, json=json_body, timeout=15)
+    elif method == "DELETE":
+        r = requests.delete(url, headers=headers, timeout=15)
+    else:
+        raise ValueError(f"Unsupported authenticated method: {method}")
+
+    print(f"AUTH {method} {path}: {r.status_code} {r.text[:500]}")
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
 def utc_now():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -411,20 +431,20 @@ def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts):
         "cancel_order_on_pause": True,
     }
 
-    resp = auth_request("POST", "/portfolio/events/orders", json_body=payload)
+    resp = authenticated_request("POST", "/portfolio/events/orders", json_body=payload)
     order = resp.get("order", resp)
     print(f"RESTING LIMIT ORDER: {order}")
     return order
 
 
 def get_demo_order(order_id):
-    resp = auth_request("GET", f"/portfolio/orders/{order_id}")
+    resp = authenticated_request("GET", f"/portfolio/orders/{order_id}")
     return resp.get("order", resp)
 
 
 def cancel_demo_order(order_id):
     try:
-        resp = auth_request("DELETE", f"/portfolio/events/orders/{order_id}")
+        resp = authenticated_request("DELETE", f"/portfolio/events/orders/{order_id}")
         print(f"CANCEL RESULT: {resp}")
         return resp
     except Exception as e:
