@@ -41,7 +41,6 @@ ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
 RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "1"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 MAX_CLOSE_CAPTURE_LAG_SECONDS = float(os.getenv("MAX_CLOSE_CAPTURE_LAG_SECONDS", "3"))
-DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() == "true"
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
 # RAILWAY_VOLUME_MOUNT_PATH automatically. Otherwise, fall back to ./data.
@@ -72,6 +71,7 @@ TRADE_FIELDS = [
 SESSION_FIELDS = [
     "captured_time_utc",
     "ticker",
+    "next_ticker",
     "event_ticker",
     "open_time_utc",
     "close_time_utc",
@@ -791,6 +791,179 @@ def print_last_five_immediate(markets):
         )
     print("  SEQUENCE: " + " | ".join((m.get("result") or "?").upper() for m in recent))
 
+
+
+def get_recent_kxbtc15m_markets_for_strikes():
+    """
+    Kalshi-only market list around the current time. No settlement/result fields
+    are required for the trading decision.
+    """
+    now_ts = int(utc_now().timestamp())
+    data = get_json(
+        "/markets",
+        {
+            "series_ticker": SERIES,
+            "min_close_ts": now_ts - 4 * 3600,
+            "max_close_ts": now_ts + 3600,
+            "limit": 200,
+        },
+    )
+    markets = data.get("markets", [])
+    markets.sort(key=lambda m: m.get("open_time") or "")
+    return markets
+
+
+def market_strike_record(market):
+    strike, source = extract_kalshi_start_btc(market)
+    if strike is None:
+        return None
+    return {
+        "ticker": market.get("ticker"),
+        "event_ticker": market.get("event_ticker"),
+        "open_time": market.get("open_time"),
+        "close_time": market.get("close_time"),
+        "strike": strike,
+        "source": source,
+    }
+
+
+def derive_successive_strike_results():
+    """
+    Derive each completed 15-minute session outcome from adjacent Kalshi strikes:
+
+        next_strike > prior_strike -> prior session YES
+        next_strike < prior_strike -> prior session NO
+        equal                    -> TIE
+
+    No official Kalshi result, Past page, settlement average, or external BTC
+    source is used.
+    """
+    markets = get_recent_kxbtc15m_markets_for_strikes()
+    strikes = []
+
+    for market in markets:
+        rec = market_strike_record(market)
+        if rec is not None and rec.get("ticker"):
+            strikes.append(rec)
+
+    # Deduplicate by ticker and keep chronological order.
+    by_ticker = {r["ticker"]: r for r in strikes}
+    strikes = list(by_ticker.values())
+    strikes.sort(key=lambda r: r.get("open_time") or "")
+
+    derived = []
+    for prior, nxt in zip(strikes, strikes[1:]):
+        prior_strike = prior["strike"]
+        next_strike = nxt["strike"]
+        distance = next_strike - prior_strike
+
+        if distance > 0:
+            result = "yes"
+        elif distance < 0:
+            result = "no"
+        else:
+            result = "tie"
+
+        derived.append({
+            "ticker": prior["ticker"],
+            "next_ticker": nxt["ticker"],
+            "event_ticker": prior.get("event_ticker") or "",
+            "open_time": prior.get("open_time") or "",
+            "close_time": prior.get("close_time") or "",
+            "kalshi_start_btc": prior_strike,
+            "kalshi_close_btc": next_strike,
+            "close_distance": distance,
+            "result": result,
+            "start_source": prior.get("source") or "",
+            "next_source": nxt.get("source") or "",
+        })
+
+    return derived
+
+
+def persist_successive_strike_results(derived):
+    """
+    Persist newly inferred session results to btc_session_results.csv.
+    Existing rows are replaced for matching tickers so old FLAG rows from the
+    abandoned live-data method do not poison the streak.
+    """
+    rows = read_session_log()
+    existing = {r.get("ticker"): r for r in rows if r.get("ticker")}
+
+    for d in derived:
+        ticker = d["ticker"]
+        row = {
+            "captured_time_utc": utc_now().isoformat(timespec="seconds"),
+            "ticker": ticker,
+            "next_ticker": d.get("next_ticker") or "",
+            "event_ticker": d.get("event_ticker") or "",
+            "open_time_utc": d.get("open_time") or "",
+            "close_time_utc": d.get("close_time") or "",
+            "kalshi_start_btc": format_decimal(d.get("kalshi_start_btc")),
+            "kalshi_close_btc": format_decimal(d.get("kalshi_close_btc")),
+            "close_distance": format_decimal(d.get("close_distance")),
+            "immediate_result": d.get("result") or "flag",
+            "close_capture_lag_seconds": "",
+            "close_price_source": "next_kalshi_session_strike",
+            "live_price_path": "",
+            "milestone_id": "",
+            "note": (
+                f"start_source={d.get('start_source','')}; "
+                f"next_source={d.get('next_source','')}; "
+                "outcome=successive_strike"
+            ),
+        }
+        existing[ticker] = row
+
+    merged = list(existing.values())
+    merged.sort(key=lambda r: r.get("close_time_utc") or "")
+    write_session_log(merged)
+
+
+def successive_strike_markets():
+    """
+    Return market-like records consumed by existing streak and P&L helpers.
+    """
+    derived = derive_successive_strike_results()
+    persist_successive_strike_results(derived)
+
+    markets = []
+    for d in derived:
+        markets.append({
+            "ticker": d["ticker"],
+            "close_time": d.get("close_time") or "",
+            "result": d.get("result") or "flag",
+            "kalshi_start_btc": format_decimal(d.get("kalshi_start_btc")),
+            "kalshi_close_btc": format_decimal(d.get("kalshi_close_btc")),
+            "close_distance": format_decimal(d.get("close_distance")),
+            "next_ticker": d.get("next_ticker") or "",
+        })
+    markets.sort(key=lambda m: m.get("close_time") or "")
+    return markets
+
+
+def print_last_five_successive(markets):
+    recent = markets[-5:]
+    print("LAST 5 SUCCESSIVE-STRIKE RESULTS:")
+    if not recent:
+        print("  none")
+        return
+
+    for m in recent:
+        print(
+            f"  {m.get('close_time','?')} | {m.get('ticker','?')} -> "
+            f"{m.get('next_ticker','?')} | "
+            f"start={m.get('kalshi_start_btc','')} "
+            f"next_strike={m.get('kalshi_close_btc','')} "
+            f"distance={m.get('close_distance','')} | "
+            f"{(m.get('result') or '?').upper()}"
+        )
+
+    print(
+        "  SEQUENCE: "
+        + " | ".join((m.get("result") or "?").upper() for m in recent)
+    )
+
 def get_recent_settled_markets():
     # IMPORTANT: Recent settlements belong on the live /markets endpoint.
     # /historical/markets is only for markets older than Kalshi's historical cutoff.
@@ -1297,58 +1470,41 @@ def main():
     ensure_trade_log()
     ensure_session_log()
 
-    print("KALSHI BTC 15-MINUTE BOT")
+    print("KALSHI BTC 15-MINUTE STREAK BOT")
     print(
         f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} "
         f"CAP={MAX_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m "
         f"ORDER_POLL={POLL_ORDER_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s "
         f"RETRIES={ORDER_SUBMIT_RETRIES} RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
-    print("OUTCOME SOURCE=Kalshi displayed BTC start/target vs Kalshi live BTC at close")
-    print("OFFICIAL DETERMINATION=not used for trading decision")
-    print("BOUNDARY CAPTURE=pre-cache open session, then read Kalshi live_data at close")
-    print(f"DEBUG_LIVE_DATA={DEBUG_LIVE_DATA}")
+    print("OUTCOME METHOD=successive Kalshi session strikes only")
+    print("OFFICIAL RESULT=not used")
+    print("EXTERNAL BTC SOURCES=not used")
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
 
     completed_markets = logged_tickers()
     current_order = None
     last_sequence_ticker = None
-    prepared_session = None
 
     print_summary()
 
     while True:
         try:
-            # Prepare the currently open session BEFORE it closes so ticker,
-            # start price, and live-data milestone IDs are already cached.
-            if prepared_session is None:
-                prepared_session = prepare_current_session()
+            # Build the immediate streak strictly from adjacent Kalshi strikes.
+            immediate_markets = successive_strike_markets()
 
-            # As the boundary approaches, block only for the final few seconds
-            # and capture from the cached session immediately at close.
-            captured, prepared_session = capture_prepared_if_due(prepared_session)
-
-            # If a capture just completed, prepare the newly opened session on
-            # the next loop. We intentionally do not rediscover the old one.
-            immediate_markets = session_rows_as_markets()
-            # Settle our tracker from the same immediate decision outcome.
-            # FLAG/TIE sessions never settle a pending trade as a win/loss.
-            settle_pending_trades([
-                m for m in immediate_markets if m.get("result") in {"yes", "no"}
-            ])
-
-            newest_ticker = immediate_markets[-1].get("ticker") if immediate_markets else None
-            if captured or newest_ticker != last_sequence_ticker:
-                print_last_five_immediate(immediate_markets)
+            newest_ticker = (
+                immediate_markets[-1].get("ticker") if immediate_markets else None
+            )
+            if newest_ticker != last_sequence_ticker:
+                print_last_five_successive(immediate_markets)
                 last_sequence_ticker = newest_ticker
-                if captured:
-                    print("BOUNDARY CAPTURE COMPLETE: preparing next session.")
 
             last_result, streak = calculate_streak(immediate_markets)
             print(f"CALCULATED IMMEDIATE: last={last_result} streak={streak}")
 
-            # Existing resting-order safety/monitoring stays intact.
+            # Manage any already accepted resting order.
             if current_order is not None:
                 order_id = current_order["order_id"]
                 ticker = current_order["ticker"]
@@ -1400,17 +1556,14 @@ def main():
                 time.sleep(POLL_ORDER_SECONDS)
                 continue
 
-            # A TIE/FLAG or insufficient immediate streak means no order.
-            if streak < STREAK_TRIGGER:
+            # TIE/FLAG deliberately breaks the streak.
+            if last_result not in {"yes", "no"} or streak < STREAK_TRIGGER:
                 sleep_idle()
                 continue
 
             market = qualifying_current_market(get_open_markets())
             if market is None:
-                print(
-                    "No qualifying market inside entry window. "
-                    "Will wake before next 15-minute boundary."
-                )
+                print("No qualifying market inside entry window; waiting for next session.")
                 sleep_idle()
                 continue
 
@@ -1423,15 +1576,9 @@ def main():
                 sleep_idle()
                 continue
 
-            # Locked execution decision: immediately rest at the adjustable
-            # Railway MAX_ENTRY_CENTS price; do not chase bid/ask.
             limit_cents = MAX_ENTRY_CENTS
-            if limit_cents < MIN_ENTRY_CENTS:
-                print(f"SKIP: configured limit {limit_cents}c is invalid.")
-                sleep_idle()
-                continue
-
             expiration_ts = market_entry_expiration_ts(market)
+
             if utc_now().timestamp() >= expiration_ts:
                 print(f"SKIP: entry window already expired for {ticker}.")
                 sleep_idle()
@@ -1439,8 +1586,7 @@ def main():
 
             print(
                 f"PLACE LIMIT: {ticker} buy {side.upper()} "
-                f"{CONTRACTS:g} @ {limit_cents}c age={age:.2f}m "
-                f"expires at entry-window end."
+                f"{CONTRACTS:g} @ {limit_cents}c age={age:.2f}m"
             )
 
             if MODE == "paper":
@@ -1460,6 +1606,7 @@ def main():
             order = submit_resting_order_with_retry(
                 ticker, side, limit_cents, expiration_ts
             )
+
             if order is None:
                 sleep_active()
                 continue
@@ -1493,7 +1640,7 @@ def main():
 
             print(
                 f"ORDER RESTING: {ticker} {side.upper()} @ {limit_cents}c. "
-                f"Monitoring every {POLL_ORDER_SECONDS:g}s until fill/expiration."
+                f"Monitoring every {POLL_ORDER_SECONDS:g}s."
             )
             time.sleep(POLL_ORDER_SECONDS)
 
