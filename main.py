@@ -383,6 +383,210 @@ def fetch_kalshi_displayed_btc(market, start_btc):
     return None, "", "", ""
 
 
+
+
+def choose_current_open_session():
+    """
+    Pick the currently active KXBTC15M session by its scheduled open/close
+    times. This happens BEFORE close so we do not need to rediscover the
+    market afterward.
+    """
+    now = utc_now()
+    candidates = []
+    for market in get_open_markets():
+        opened = parse_time(market.get("open_time"))
+        closes = parse_time(market.get("close_time"))
+        if opened is None or closes is None:
+            continue
+        if opened <= now < closes:
+            candidates.append((closes, market))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def prepare_current_session():
+    """
+    Cache everything we can before the boundary:
+      - exact ticker
+      - Kalshi-displayed start/target BTC price
+      - close timestamp
+      - crypto milestone IDs used by Kalshi live_data
+
+    No outside data source is used.
+    """
+    market = choose_current_open_session()
+    if market is None:
+        return None
+
+    ticker = market.get("ticker")
+    if not ticker or ticker in logged_session_tickers():
+        return None
+
+    close_time = parse_time(market.get("close_time"))
+    start_btc, start_source = extract_kalshi_start_btc(market)
+
+    milestones = get_crypto_milestones(market.get("event_ticker")) if market.get("event_ticker") else []
+    milestone_ids = [m.get("id") for m in milestones if m.get("id")]
+
+    prepared = {
+        "ticker": ticker,
+        "market": market,
+        "close_time": close_time,
+        "start_btc": start_btc,
+        "start_source": start_source,
+        "milestone_ids": milestone_ids,
+        "prepared_at": utc_now(),
+    }
+
+    print(
+        f"PREPARED CLOSE: {ticker} "
+        f"start={format_decimal(start_btc) or '?'} "
+        f"close_time={market.get('close_time')} "
+        f"milestones={len(milestone_ids)}"
+    )
+    return prepared
+
+
+def fetch_prepared_kalshi_close(prepared):
+    """
+    Read Kalshi live_data at the boundary using milestone IDs cached before
+    close. This deliberately avoids rediscovering the market after it closes.
+    """
+    start_btc = prepared.get("start_btc")
+    for milestone_id in prepared.get("milestone_ids") or []:
+        try:
+            payload = get_json(f"/live_data/milestone/{milestone_id}")
+        except Exception as exc:
+            print(
+                f"KALSHI LIVE DATA WARNING: milestone={milestone_id} "
+                f"{exc!r}"
+            )
+            continue
+
+        live_data = payload.get("live_data", payload)
+        price, path = extract_btc_price_from_live_data(live_data, start_btc)
+        if price is not None:
+            return price, "kalshi_live_data_cached_milestone", path, milestone_id
+
+    return None, "", "", ""
+
+
+def capture_prepared_session(prepared):
+    """
+    Capture the prepared session at/just after its scheduled close.
+
+    We use the exact market and milestone IDs cached while the session was
+    still open. If the boundary is missed by more than the safety tolerance,
+    flag it rather than substituting a later value.
+    """
+    if not prepared:
+        return False
+
+    market = prepared["market"]
+    ticker = prepared["ticker"]
+
+    if ticker in logged_session_tickers():
+        return False
+
+    close_time = prepared.get("close_time")
+    if close_time is None:
+        return append_session_result(
+            market, prepared.get("start_btc"), None, "", "", "", 9999,
+            note="prepared session missing close_time"
+        )
+
+    now = utc_now()
+    if now < close_time:
+        return False
+
+    capture_lag = (now - close_time).total_seconds()
+    start_btc = prepared.get("start_btc")
+
+    if capture_lag > MAX_CLOSE_CAPTURE_LAG_SECONDS:
+        return append_session_result(
+            market,
+            start_btc,
+            None,
+            "",
+            "",
+            "",
+            capture_lag,
+            note=(
+                f"prepared boundary capture was {capture_lag:.3f}s late; "
+                "no external/history substitution allowed"
+            ),
+        )
+
+    if start_btc is None:
+        return append_session_result(
+            market, None, None, "", "", "", capture_lag,
+            note="Kalshi displayed starting/target BTC price unavailable before close"
+        )
+
+    close_btc, source, live_path, milestone_id = fetch_prepared_kalshi_close(prepared)
+
+    if close_btc is None:
+        return append_session_result(
+            market,
+            start_btc,
+            None,
+            "",
+            "",
+            milestone_id,
+            capture_lag,
+            note=(
+                "Kalshi live BTC display unavailable from cached live_data "
+                "at boundary; session flagged"
+            ),
+        )
+
+    return append_session_result(
+        market,
+        start_btc,
+        close_btc,
+        source,
+        live_path,
+        milestone_id,
+        capture_lag,
+        note=f"start_source={prepared.get('start_source','')}; prepared_before_close=true",
+    )
+
+
+def capture_prepared_if_due(prepared):
+    """
+    When we are within WAKE_BEFORE_BOUNDARY_SECONDS of the prepared close,
+    wait precisely for the boundary and capture immediately.
+
+    Returns (captured, prepared_after).
+    """
+    if not prepared:
+        return False, None
+
+    close_time = prepared.get("close_time")
+    if close_time is None:
+        return False, prepared
+
+    seconds_left = (close_time - utc_now()).total_seconds()
+
+    if 0 < seconds_left <= WAKE_BEFORE_BOUNDARY_SECONDS:
+        print(
+            f"BOUNDARY ARMED: {prepared['ticker']} "
+            f"closing in {seconds_left:.3f}s"
+        )
+        time.sleep(seconds_left)
+        captured = capture_prepared_session(prepared)
+        return captured, None if captured else prepared
+
+    if seconds_left <= 0:
+        captured = capture_prepared_session(prepared)
+        return captured, None if captured else prepared
+
+    return False, prepared
+
 def get_latest_market_closed_by_time():
     """
     Find the newest KXBTC15M session whose scheduled close_time has passed.
@@ -1079,21 +1283,30 @@ def main():
     )
     print("OUTCOME SOURCE=Kalshi displayed BTC start/target vs Kalshi live BTC at close")
     print("OFFICIAL DETERMINATION=not used for trading decision")
+    print("BOUNDARY CAPTURE=pre-cache open session, then read Kalshi live_data at close")
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
 
     completed_markets = logged_tickers()
     current_order = None
     last_sequence_ticker = None
+    prepared_session = None
 
     print_summary()
 
     while True:
         try:
-            # First priority around every 15-minute boundary: record the
-            # just-closed session immediately from Kalshi-only display data.
-            captured = capture_just_closed_session()
+            # Prepare the currently open session BEFORE it closes so ticker,
+            # start price, and live-data milestone IDs are already cached.
+            if prepared_session is None:
+                prepared_session = prepare_current_session()
 
+            # As the boundary approaches, block only for the final few seconds
+            # and capture from the cached session immediately at close.
+            captured, prepared_session = capture_prepared_if_due(prepared_session)
+
+            # If a capture just completed, prepare the newly opened session on
+            # the next loop. We intentionally do not rediscover the old one.
             immediate_markets = session_rows_as_markets()
             # Settle our tracker from the same immediate decision outcome.
             # FLAG/TIE sessions never settle a pending trade as a win/loss.
@@ -1105,6 +1318,8 @@ def main():
             if captured or newest_ticker != last_sequence_ticker:
                 print_last_five_immediate(immediate_markets)
                 last_sequence_ticker = newest_ticker
+                if captured:
+                    print("BOUNDARY CAPTURE COMPLETE: preparing next session.")
 
             last_result, streak = calculate_streak(immediate_markets)
             print(f"CALCULATED IMMEDIATE: last={last_result} streak={streak}")
