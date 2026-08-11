@@ -436,7 +436,7 @@ def market_entry_expiration_ts(market):
     """
     Expiration = market open time + ENTRY_WINDOW_MINUTES.
     """
-    open_time = parse_ts(market.get("open_time"))
+    open_time = parse_time(market.get("open_time"))
     if open_time is None:
         raise ValueError("market missing open_time")
     return int((open_time + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp())
