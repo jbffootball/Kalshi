@@ -27,9 +27,12 @@ if PLACE_ORDERS and "demo.kalshi.co" not in BASE_URL:
 SERIES = os.getenv("SERIES", "KXBTC15M")
 STREAK_TRIGGER = int(os.getenv("STREAK_TRIGGER", "2"))
 MAX_ENTRY_CENTS = int(os.getenv("MAX_ENTRY_CENTS", "40"))
+MIN_ENTRY_CENTS = int(os.getenv("MIN_ENTRY_CENTS", "1"))
 ENTRY_WINDOW_MINUTES = float(os.getenv("ENTRY_WINDOW_MINUTES", "3"))
 CONTRACTS = float(os.getenv("CONTRACTS", "1"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
+POLL_ACTIVE_SECONDS = float(os.getenv("POLL_ACTIVE_SECONDS", "2"))
+POLL_IDLE_SECONDS = float(os.getenv("POLL_IDLE_SECONDS", "60"))
+WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
 # RAILWAY_VOLUME_MOUNT_PATH automatically. Otherwise, fall back to ./data.
@@ -87,6 +90,26 @@ def auth_headers(method, path):
 
 def utc_now():
     return dt.datetime.now(dt.timezone.utc)
+
+
+def seconds_to_next_15m_boundary(now=None):
+    now = now or utc_now()
+    seconds_into_block = (now.minute % 15) * 60 + now.second + now.microsecond / 1_000_000
+    return 900 - seconds_into_block
+
+
+def idle_sleep_seconds():
+    # Never sleep past the next 15-minute market opening.
+    wake_in = max(1.0, seconds_to_next_15m_boundary() - WAKE_BEFORE_BOUNDARY_SECONDS)
+    return min(POLL_IDLE_SECONDS, wake_in)
+
+
+def sleep_active():
+    time.sleep(POLL_ACTIVE_SECONDS)
+
+
+def sleep_idle():
+    time.sleep(idle_sleep_seconds())
 
 
 def parse_time(value):
@@ -228,6 +251,21 @@ def filled_quantity(resp):
         return 0.0
 
 
+def actual_fill_cents(resp, side, fallback_cents):
+    """Use Kalshi's returned average fill price when available."""
+    raw = resp.get("average_price") or resp.get("price")
+    try:
+        px = float(raw)
+    except (TypeError, ValueError):
+        return float(fallback_cents)
+
+    # For YES, returned price is the YES contract price. For NO orders the
+    # current order payload uses the complementary book price, so convert back.
+    if side == "yes":
+        return round(px * 100.0, 4)
+    return round((1.0 - px) * 100.0, 4)
+
+
 def ensure_trade_log():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(TRADE_LOG):
@@ -338,9 +376,21 @@ def print_summary(rows=None):
 def main():
     ensure_trade_log()
     print("KALSHI BTC STREAK BOT")
-    print(f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} CAP={MAX_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m")
+    print(
+        f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} "
+        f"CAP={MAX_ENTRY_CENTS}c MIN={MIN_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m "
+        f"ACTIVE_POLL={POLL_ACTIVE_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s"
+    )
     print(f"TRACKING FILE={TRADE_LOG}")
-    traded_markets = logged_tickers()
+
+    # Any ticker in the persistent trade log is considered completed/claimed
+    # for this bot. This survives Railway restarts and prevents a second fill.
+    completed_markets = logged_tickers()
+
+    # Single-process submission lock. The bot will never have two order POSTs
+    # in flight at the same time.
+    order_in_flight = set()
+
     print_summary()
 
     while True:
@@ -353,13 +403,13 @@ def main():
             print(f"CALCULATED: last={last_result} streak={streak}")
             print(f"{utc_now().isoformat(timespec='seconds')} last={last_result} streak={streak}")
             if streak < STREAK_TRIGGER:
-                time.sleep(POLL_SECONDS)
+                sleep_idle()
                 continue
 
             market = qualifying_current_market(get_open_markets())
             if market is None:
-                print("No qualifying market inside entry window.")
-                time.sleep(POLL_SECONDS)
+                print(f"No qualifying market inside entry window. Idle poll up to {POLL_IDLE_SECONDS:g}s.")
+                sleep_idle()
                 continue
 
             ticker = market["ticker"]
@@ -368,33 +418,71 @@ def main():
             ask = entry_ask_cents(market, side)
             print(f"Watch {ticker}: buy {side.upper()} age={age:.2f}m ask={ask}c cap={MAX_ENTRY_CENTS}c")
 
-            if ticker in traded_markets or ask is None or ask > MAX_ENTRY_CENTS:
-                time.sleep(POLL_SECONDS)
+            if ticker in completed_markets:
+                print(f"SKIP: {ticker} already has a recorded signal/fill; no second trade allowed.")
+                sleep_active()
+                continue
+
+            if ticker in order_in_flight:
+                print(f"SKIP: order already in flight for {ticker}.")
+                sleep_active()
+                continue
+
+            if ask is None:
+                print("SKIP: no valid ask available.")
+                sleep_active()
+                continue
+
+            if ask < MIN_ENTRY_CENTS:
+                print(f"SKIP: suspicious ask {ask}c below minimum {MIN_ENTRY_CENTS}c.")
+                sleep_active()
+                continue
+
+            if ask > MAX_ENTRY_CENTS:
+                print(f"SKIP: ask {ask}c above cap {MAX_ENTRY_CENTS}c.")
+                sleep_active()
                 continue
 
             print(f"QUALIFIED: {side.upper()} at {ask}c")
             if MODE == "paper":
                 print("PAPER SIGNAL ONLY â no order sent.")
                 log_signal(ticker, last_result, streak, side, ask, age)
-                traded_markets.add(ticker)
+                completed_markets.add(ticker)
+
             elif not PLACE_ORDERS:
                 print("DEMO signal only â PLACE_DEMO_ORDERS=false.")
                 log_signal(ticker, last_result, streak, side, ask, age)
-                traded_markets.add(ticker)
-            else:
-                resp = place_demo_ioc_order(ticker, side, ask)
-                if filled_quantity(resp) > 0:
-                    log_signal(ticker, last_result, streak, side, ask, age)
-                    traded_markets.add(ticker)
-                else:
-                    print("No fill; can retry while still inside the entry window.")
+                completed_markets.add(ticker)
 
-            time.sleep(POLL_SECONDS)
+            else:
+                # IOC means an unfilled attempt is automatically canceled by
+                # Kalshi; there is no resting order left behind to stack.
+                order_in_flight.add(ticker)
+                try:
+                    resp = place_demo_ioc_order(ticker, side, ask)
+                    fill_qty = filled_quantity(resp)
+                    if fill_qty > 0:
+                        fill_cents = actual_fill_cents(resp, side, ask)
+                        print(
+                            f"FILLED: {ticker} {side.upper()} qty={fill_qty:g} "
+                            f"at ~{fill_cents:.1f}c. MARKET LOCKED â no more orders this market."
+                        )
+                        log_signal(ticker, last_result, streak, side, fill_cents, age)
+                        completed_markets.add(ticker)
+                    else:
+                        print(
+                            "NO FILL: IOC order canceled automatically. "
+                            "No live order remains; bot may retry on a later poll while still eligible."
+                        )
+                finally:
+                    order_in_flight.discard(ticker)
+
+            sleep_active()
         except KeyboardInterrupt:
             break
         except Exception as e:
             print("ERROR:", repr(e))
-            time.sleep(POLL_SECONDS)
+            time.sleep(min(10.0, POLL_IDLE_SECONDS))
 
 
 if __name__ == "__main__":
