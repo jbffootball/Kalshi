@@ -581,7 +581,9 @@ def wait_for_previous_result():
     ticker = previous.get("ticker")
     result = (previous.get("result") or "").lower()
     if result in {"yes", "no"}:
+        observed_at = utc_now()
         print(f"PREVIOUS RESULT ALREADY AVAILABLE: {ticker} = {result.upper()}")
+        log_determination_delay(previous, observed_at)
         return previous
 
     started = utc_now()
@@ -593,12 +595,27 @@ def wait_for_previous_result():
         result = (market.get("result") or "").lower()
         status = (market.get("status") or "").lower()
         if result in {"yes", "no"}:
-            delay = (utc_now() - started).total_seconds()
-            print(f"PREVIOUS RESULT AVAILABLE: {ticker} = {result.upper()} status={status} after {delay:.2f}s")
+            observed_at = utc_now()
+            wait_delay = (observed_at - started).total_seconds()
+            print(f"PREVIOUS RESULT AVAILABLE: {ticker} = {result.upper()} status={status} after {wait_delay:.2f}s of polling")
+            log_determination_delay(market, observed_at)
             return market
         time.sleep(RESULT_POLL_SECONDS)
 
-    print(f"PREVIOUS RESULT TIMEOUT: {ticker}")
+    print(f"PREVIOUS RESULT TIMEOUT FOR TRADING: {ticker}. Continuing to measure determination delay only.")
+    measurement_deadline = utc_now() + dt.timedelta(minutes=10)
+    while utc_now() < measurement_deadline:
+        market = get_market_by_ticker(ticker)
+        result = (market.get("result") or "").lower()
+        status = (market.get("status") or "").lower()
+        if result in {"yes", "no"}:
+            observed_at = utc_now()
+            print(f"LATE PREVIOUS RESULT: {ticker} = {result.upper()} status={status}")
+            log_determination_delay(market, observed_at)
+            return None
+        time.sleep(RESULT_POLL_SECONDS)
+
+    print(f"DETERMINATION MEASUREMENT TIMEOUT: {ticker} still has no yes/no after 10 additional minutes.")
     return None
 
 
@@ -612,6 +629,25 @@ def merge_fast_result(settled_markets, fast_market):
     combined = list(by_ticker.values())
     combined.sort(key=lambda m: m.get("close_time") or "")
     return combined
+
+
+
+def log_determination_delay(market, observed_at=None):
+    if not market:
+        return
+    observed_at = observed_at or utc_now()
+    ticker = market.get("ticker", "?")
+    close_raw = market.get("close_time")
+    close_time = parse_time(close_raw) if close_raw else None
+    result = (market.get("result") or "").upper()
+    status = market.get("status") or "?"
+    if close_time is None:
+        print(f"DETERMINATION TIMING: {ticker} result={result or '?'} status={status} close_time=unknown observed={observed_at.isoformat()}")
+        return
+    delay = (observed_at - close_time).total_seconds()
+    print(f"SESSION CLOSED: {ticker} at {close_time.isoformat()}")
+    print(f"RESULT AVAILABLE: {ticker} = {result or '?'} status={status} observed={observed_at.isoformat()}")
+    print(f"DETERMINATION DELAY: {delay:.3f} seconds")
 
 
 def main():
