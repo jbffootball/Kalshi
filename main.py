@@ -32,6 +32,9 @@ ENTRY_WINDOW_MINUTES = float(os.getenv("ENTRY_WINDOW_MINUTES", "3"))
 CONTRACTS = float(os.getenv("CONTRACTS", "1"))
 POLL_ACTIVE_SECONDS = float(os.getenv("POLL_ACTIVE_SECONDS", "2"))
 POLL_IDLE_SECONDS = float(os.getenv("POLL_IDLE_SECONDS", "60"))
+POLL_ORDER_SECONDS = float(os.getenv("POLL_ORDER_SECONDS", "10"))
+ORDER_SUBMIT_RETRIES = int(os.getenv("ORDER_SUBMIT_RETRIES", "3"))
+ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
@@ -373,23 +376,165 @@ def print_summary(rows=None):
     )
 
 
+
+def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts):
+    """
+    Place one resting limit order that expires automatically at the end of
+    the configured entry window.
+    """
+    if MODE != "demo":
+        raise RuntimeError("Resting demo orders require MODE=demo")
+    if not PLACE_ORDERS:
+        raise RuntimeError("PLACE_DEMO_ORDERS is false")
+
+    client_order_id = str(uuid.uuid4())
+
+    # V2 event-market book quotes everything from the YES side.
+    # Buy YES = bid at YES price.
+    # Buy NO at X cents = ask YES at (1-X) dollars.
+    if side == "yes":
+        book_side = "bid"
+        price_dollars = limit_cents / 100.0
+    else:
+        book_side = "ask"
+        price_dollars = 1.0 - (limit_cents / 100.0)
+
+    payload = {
+        "ticker": ticker,
+        "client_order_id": client_order_id,
+        "side": book_side,
+        "count": f"{CONTRACTS:.2f}",
+        "price": f"{price_dollars:.4f}",
+        "time_in_force": "good_till_canceled",
+        "expiration_time": int(expiration_ts),
+        "self_trade_prevention_type": "taker_at_cross",
+        "cancel_order_on_pause": True,
+    }
+
+    resp = auth_request("POST", "/portfolio/events/orders", json_body=payload)
+    order = resp.get("order", resp)
+    print(f"RESTING LIMIT ORDER: {order}")
+    return order
+
+
+def get_demo_order(order_id):
+    resp = auth_request("GET", f"/portfolio/orders/{order_id}")
+    return resp.get("order", resp)
+
+
+def cancel_demo_order(order_id):
+    try:
+        resp = auth_request("DELETE", f"/portfolio/events/orders/{order_id}")
+        print(f"CANCEL RESULT: {resp}")
+        return resp
+    except Exception as e:
+        print(f"CANCEL WARNING: {e!r}")
+        return None
+
+
+def market_entry_expiration_ts(market):
+    """
+    Expiration = market open time + ENTRY_WINDOW_MINUTES.
+    """
+    open_time = parse_ts(market.get("open_time"))
+    if open_time is None:
+        raise ValueError("market missing open_time")
+    return int((open_time + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp())
+
+
+def order_fill_count(order):
+    for key in ("fill_count_fp", "fill_count"):
+        try:
+            return float(order.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def order_remaining_count(order):
+    for key in ("remaining_count_fp", "remaining_count"):
+        try:
+            return float(order.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts):
+    """
+    Try to submit the resting limit order up to ORDER_SUBMIT_RETRIES times.
+    Stop immediately once Kalshi accepts an order. Never retry after the
+    configured entry window has expired.
+    """
+    last_error = None
+
+    for attempt in range(1, ORDER_SUBMIT_RETRIES + 1):
+        now_ts = utc_now().timestamp()
+        if now_ts >= expiration_ts:
+            print(
+                f"SUBMIT STOP: entry window expired before attempt "
+                f"{attempt}/{ORDER_SUBMIT_RETRIES}."
+            )
+            break
+
+        try:
+            print(
+                f"SUBMIT ATTEMPT {attempt}/{ORDER_SUBMIT_RETRIES}: "
+                f"{ticker} {side.upper()} @ {limit_cents}c"
+            )
+            order = place_demo_resting_limit_order(
+                ticker, side, limit_cents, expiration_ts
+            )
+            print(
+                f"SUBMIT ACCEPTED on attempt {attempt}: "
+                f"order_id={order.get('order_id')}"
+            )
+            return order
+
+        except Exception as e:
+            last_error = e
+            print(
+                f"SUBMIT REJECTED attempt {attempt}/{ORDER_SUBMIT_RETRIES}: "
+                f"{e!r}"
+            )
+
+            if attempt >= ORDER_SUBMIT_RETRIES:
+                break
+
+            seconds_left = expiration_ts - utc_now().timestamp()
+            if seconds_left <= 0:
+                break
+
+            sleep_for = min(ORDER_RETRY_SECONDS, max(0.0, seconds_left))
+            if sleep_for <= 0:
+                break
+
+            print(f"Retrying in {sleep_for:g}s...")
+            time.sleep(sleep_for)
+
+    print(
+        f"SUBMIT FAILED: no resting order accepted for {ticker} "
+        f"after up to {ORDER_SUBMIT_RETRIES} attempts."
+    )
+    if last_error is not None:
+        print(f"LAST SUBMIT ERROR: {last_error!r}")
+    return None
+
 def main():
     ensure_trade_log()
     print("KALSHI BTC STREAK BOT")
     print(
         f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} "
         f"CAP={MAX_ENTRY_CENTS}c MIN={MIN_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m "
-        f"ACTIVE_POLL={POLL_ACTIVE_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s"
+        f"ACTIVE_POLL={POLL_ACTIVE_SECONDS}s ORDER_POLL={POLL_ORDER_SECONDS}s "
+        f"IDLE_POLL={POLL_IDLE_SECONDS}s RETRIES={ORDER_SUBMIT_RETRIES} "
+        f"RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
     print(f"TRACKING FILE={TRADE_LOG}")
 
-    # Any ticker in the persistent trade log is considered completed/claimed
-    # for this bot. This survives Railway restarts and prevents a second fill.
     completed_markets = logged_tickers()
-
-    # Single-process submission lock. The bot will never have two order POSTs
-    # in flight at the same time.
-    order_in_flight = set()
+    current_order = None
+    last_sequence_ticker = None
 
     print_summary()
 
@@ -398,87 +543,175 @@ def main():
             settled = get_recent_settled_markets()
             settle_pending_trades(settled)
 
-            print_last_five(settled)
+            # Print diagnostics only when the newest settlement changes.
+            newest_settled_ticker = settled[-1].get("ticker") if settled else None
+            if newest_settled_ticker != last_sequence_ticker:
+                print_last_five(settled)
+                last_sequence_ticker = newest_settled_ticker
+
             last_result, streak = calculate_streak(settled)
             print(f"CALCULATED: last={last_result} streak={streak}")
-            print(f"{utc_now().isoformat(timespec='seconds')} last={last_result} streak={streak}")
+
+            # If we already have a resting order, monitor it rather than
+            # submitting another one.
+            if current_order is not None:
+                order_id = current_order["order_id"]
+                ticker = current_order["ticker"]
+                side = current_order["side"]
+                entry_cents = current_order["entry_cents"]
+
+                order = get_demo_order(order_id)
+                status = (order.get("status") or "").lower()
+                filled = order_fill_count(order)
+                remaining = order_remaining_count(order)
+
+                print(
+                    f"ORDER STATUS: {ticker} {side.upper()} status={status} "
+                    f"filled={filled:g} remaining={remaining:g}"
+                )
+
+                if filled > 0:
+                    fill_cents = actual_fill_cents(order, side, entry_cents)
+                    print(
+                        f"FILLED: {ticker} {side.upper()} qty={filled:g} "
+                        f"at ~{fill_cents:.1f}c. MARKET LOCKED."
+                    )
+                    log_signal(
+                        ticker,
+                        current_order["trigger_result"],
+                        current_order["trigger_streak"],
+                        side,
+                        fill_cents,
+                        current_order["age_at_submit"],
+                    )
+                    completed_markets.add(ticker)
+                    current_order = None
+                    sleep_idle()
+                    continue
+
+                if status in {"canceled", "executed"} or remaining <= 0:
+                    print(f"ORDER CLOSED WITHOUT FILL: {ticker}")
+                    current_order = None
+                    sleep_idle()
+                    continue
+
+                # Safety fallback: if the entry window is over and the order
+                # somehow remains resting, explicitly cancel it.
+                if utc_now().timestamp() >= current_order["expiration_ts"]:
+                    print(f"ENTRY WINDOW ENDED: canceling {ticker}")
+                    cancel_demo_order(order_id)
+                    current_order = None
+                    sleep_idle()
+                    continue
+
+                time.sleep(POLL_ORDER_SECONDS)
+                continue
+
             if streak < STREAK_TRIGGER:
                 sleep_idle()
                 continue
 
             market = qualifying_current_market(get_open_markets())
             if market is None:
-                print(f"No qualifying market inside entry window. Idle poll up to {POLL_IDLE_SECONDS:g}s.")
+                print(
+                    f"No qualifying market inside entry window. "
+                    f"Will wake before next 15-minute boundary."
+                )
                 sleep_idle()
                 continue
 
             ticker = market["ticker"]
             age = market_age_minutes(market)
             side = opposite_side(last_result)
-            ask = entry_ask_cents(market, side)
-            print(f"Watch {ticker}: buy {side.upper()} age={age:.2f}m ask={ask}c cap={MAX_ENTRY_CENTS}c")
 
             if ticker in completed_markets:
-                print(f"SKIP: {ticker} already has a recorded signal/fill; no second trade allowed.")
-                sleep_active()
+                print(f"SKIP: {ticker} already completed by this bot.")
+                sleep_idle()
                 continue
 
-            if ticker in order_in_flight:
-                print(f"SKIP: order already in flight for {ticker}.")
-                sleep_active()
+            # The strategy is now explicit: place one limit order at the
+            # configured max-entry price immediately, rather than waiting for
+            # the ask to reach that price.
+            limit_cents = MAX_ENTRY_CENTS
+
+            if limit_cents < MIN_ENTRY_CENTS:
+                print(f"SKIP: configured limit {limit_cents}c is invalid.")
+                sleep_idle()
                 continue
 
-            if ask is None:
-                print("SKIP: no valid ask available.")
-                sleep_active()
+            expiration_ts = market_entry_expiration_ts(market)
+            if utc_now().timestamp() >= expiration_ts:
+                print(f"SKIP: entry window already expired for {ticker}.")
+                sleep_idle()
                 continue
 
-            if ask < MIN_ENTRY_CENTS:
-                print(f"SKIP: suspicious ask {ask}c below minimum {MIN_ENTRY_CENTS}c.")
-                sleep_active()
-                continue
+            print(
+                f"PLACE LIMIT: {ticker} buy {side.upper()} "
+                f"{CONTRACTS:g} @ {limit_cents}c age={age:.2f}m "
+                f"expires at entry-window end."
+            )
 
-            if ask > MAX_ENTRY_CENTS:
-                print(f"SKIP: ask {ask}c above cap {MAX_ENTRY_CENTS}c.")
-                sleep_active()
-                continue
-
-            print(f"QUALIFIED: {side.upper()} at {ask}c")
             if MODE == "paper":
-                print("PAPER SIGNAL ONLY â no order sent.")
-                log_signal(ticker, last_result, streak, side, ask, age)
+                print("PAPER LIMIT SIGNAL ONLY â no order sent.")
+                log_signal(ticker, last_result, streak, side, limit_cents, age)
                 completed_markets.add(ticker)
+                sleep_idle()
+                continue
 
-            elif not PLACE_ORDERS:
-                print("DEMO signal only â PLACE_DEMO_ORDERS=false.")
-                log_signal(ticker, last_result, streak, side, ask, age)
+            if not PLACE_ORDERS:
+                print("DEMO limit signal only â PLACE_DEMO_ORDERS=false.")
+                log_signal(ticker, last_result, streak, side, limit_cents, age)
                 completed_markets.add(ticker)
+                sleep_idle()
+                continue
 
-            else:
-                # IOC means an unfilled attempt is automatically canceled by
-                # Kalshi; there is no resting order left behind to stack.
-                order_in_flight.add(ticker)
-                try:
-                    resp = place_demo_ioc_order(ticker, side, ask)
-                    fill_qty = filled_quantity(resp)
-                    if fill_qty > 0:
-                        fill_cents = actual_fill_cents(resp, side, ask)
-                        print(
-                            f"FILLED: {ticker} {side.upper()} qty={fill_qty:g} "
-                            f"at ~{fill_cents:.1f}c. MARKET LOCKED â no more orders this market."
-                        )
-                        log_signal(ticker, last_result, streak, side, fill_cents, age)
-                        completed_markets.add(ticker)
-                    else:
-                        print(
-                            "NO FILL: IOC order canceled automatically. "
-                            "No live order remains; bot may retry on a later poll while still eligible."
-                        )
-                finally:
-                    order_in_flight.discard(ticker)
+            order = submit_resting_order_with_retry(
+                ticker, side, limit_cents, expiration_ts
+            )
 
-            sleep_active()
+            if order is None:
+                # No accepted order exists. Do not mark the market completed;
+                # the next loop can reassess only if the entry window is still open.
+                sleep_active()
+                continue
+
+            order_id = order.get("order_id")
+            if not order_id:
+                raise RuntimeError(f"Accepted order response missing order_id: {order}")
+
+            # Check for an immediate fill first.
+            filled = order_fill_count(order)
+            if filled > 0:
+                fill_cents = actual_fill_cents(order, side, limit_cents)
+                print(
+                    f"IMMEDIATE FILL: {ticker} {side.upper()} qty={filled:g} "
+                    f"at ~{fill_cents:.1f}c. MARKET LOCKED."
+                )
+                log_signal(ticker, last_result, streak, side, fill_cents, age)
+                completed_markets.add(ticker)
+                sleep_idle()
+                continue
+
+            current_order = {
+                "order_id": order_id,
+                "ticker": ticker,
+                "side": side,
+                "entry_cents": limit_cents,
+                "expiration_ts": expiration_ts,
+                "trigger_result": last_result,
+                "trigger_streak": streak,
+                "age_at_submit": age,
+            }
+
+            print(
+                f"ORDER RESTING: {ticker} {side.upper()} @ {limit_cents}c. "
+                f"Monitoring every {POLL_ORDER_SECONDS:g}s until fill/expiration."
+            )
+            time.sleep(POLL_ORDER_SECONDS)
+
         except KeyboardInterrupt:
+            if current_order is not None:
+                cancel_demo_order(current_order["order_id"])
             break
         except Exception as e:
             print("ERROR:", repr(e))
