@@ -35,6 +35,7 @@ POLL_IDLE_SECONDS = float(os.getenv("POLL_IDLE_SECONDS", "60"))
 POLL_ORDER_SECONDS = float(os.getenv("POLL_ORDER_SECONDS", "10"))
 ORDER_SUBMIT_RETRIES = int(os.getenv("ORDER_SUBMIT_RETRIES", "3"))
 ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
+RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "1"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
@@ -540,6 +541,79 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts):
         print(f"LAST SUBMIT ERROR: {last_error!r}")
     return None
 
+
+def get_market_by_ticker(ticker):
+    data = get_json(f"/markets/{ticker}")
+    return data.get("market", data)
+
+
+def get_most_recent_closed_market():
+    now_ts = int(utc_now().timestamp())
+    data = get_json("/markets", {
+        "series_ticker": SERIES,
+        "status": "closed",
+        "min_close_ts": now_ts - 3600,
+        "max_close_ts": now_ts,
+        "limit": 50,
+    })
+    markets = data.get("markets", [])
+    if not markets:
+        return None
+    markets.sort(key=lambda m: m.get("close_time") or "")
+    return markets[-1]
+
+
+def current_entry_deadline_ts():
+    opens = get_open_markets()
+    if opens:
+        opens.sort(key=lambda m: m.get("open_time") or "")
+        open_time = parse_time(opens[-1].get("open_time"))
+        if open_time:
+            return (open_time + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp()
+    return (utc_now() + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp()
+
+
+def wait_for_previous_result():
+    previous = get_most_recent_closed_market()
+    if not previous:
+        print("FAST RESULT: no recently closed market found.")
+        return None
+    ticker = previous.get("ticker")
+    result = (previous.get("result") or "").lower()
+    if result in {"yes", "no"}:
+        print(f"PREVIOUS RESULT ALREADY AVAILABLE: {ticker} = {result.upper()}")
+        return previous
+
+    started = utc_now()
+    deadline_ts = current_entry_deadline_ts()
+    print(f"WAITING FOR PREVIOUS RESULT: {ticker}")
+
+    while utc_now().timestamp() < deadline_ts:
+        market = get_market_by_ticker(ticker)
+        result = (market.get("result") or "").lower()
+        status = (market.get("status") or "").lower()
+        if result in {"yes", "no"}:
+            delay = (utc_now() - started).total_seconds()
+            print(f"PREVIOUS RESULT AVAILABLE: {ticker} = {result.upper()} status={status} after {delay:.2f}s")
+            return market
+        time.sleep(RESULT_POLL_SECONDS)
+
+    print(f"PREVIOUS RESULT TIMEOUT: {ticker}")
+    return None
+
+
+def merge_fast_result(settled_markets, fast_market):
+    by_ticker = {}
+    for m in settled_markets:
+        if m.get("ticker") and (m.get("result") or "").lower() in {"yes", "no"}:
+            by_ticker[m["ticker"]] = m
+    if fast_market and fast_market.get("ticker") and (fast_market.get("result") or "").lower() in {"yes", "no"}:
+        by_ticker[fast_market["ticker"]] = fast_market
+    combined = list(by_ticker.values())
+    combined.sort(key=lambda m: m.get("close_time") or "")
+    return combined
+
+
 def main():
     ensure_trade_log()
     print("KALSHI BTC STREAK BOT")
@@ -547,7 +621,8 @@ def main():
         f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} "
         f"CAP={MAX_ENTRY_CENTS}c MIN={MIN_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m "
         f"ACTIVE_POLL={POLL_ACTIVE_SECONDS}s ORDER_POLL={POLL_ORDER_SECONDS}s "
-        f"IDLE_POLL={POLL_IDLE_SECONDS}s RETRIES={ORDER_SUBMIT_RETRIES} "
+        f"IDLE_POLL={POLL_IDLE_SECONDS}s RESULT_POLL={RESULT_POLL_SECONDS}s "
+        f"RETRIES={ORDER_SUBMIT_RETRIES} "
         f"RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
     print(f"TRACKING FILE={TRADE_LOG}")
@@ -560,16 +635,18 @@ def main():
 
     while True:
         try:
-            settled = get_recent_settled_markets()
-            settle_pending_trades(settled)
+            finalized = get_recent_settled_markets()
+            settle_pending_trades(finalized)
 
-            # Print diagnostics only when the newest settlement changes.
-            newest_settled_ticker = settled[-1].get("ticker") if settled else None
-            if newest_settled_ticker != last_sequence_ticker:
-                print_last_five(settled)
-                last_sequence_ticker = newest_settled_ticker
+            fast_previous = wait_for_previous_result()
+            recent_results = merge_fast_result(finalized, fast_previous)
 
-            last_result, streak = calculate_streak(settled)
+            newest_result_ticker = recent_results[-1].get("ticker") if recent_results else None
+            if newest_result_ticker != last_sequence_ticker:
+                print_last_five(recent_results)
+                last_sequence_ticker = newest_result_ticker
+
+            last_result, streak = calculate_streak(recent_results)
             print(f"CALCULATED: last={last_result} streak={streak}")
 
             # If we already have a resting order, monitor it rather than
