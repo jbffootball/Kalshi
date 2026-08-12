@@ -813,6 +813,19 @@ def get_recent_kxbtc15m_markets_for_strikes():
     return markets
 
 
+
+def btc_session_start(market):
+    """
+    Actual KXBTC15M BTC measurement interval starts 15 minutes before close_time.
+    Kalshi's API open_time can be earlier because a market may be listed before
+    its 15-minute BTC interval begins.
+    """
+    close_dt = parse_time(market.get("close_time"))
+    if close_dt is None:
+        return None
+    return close_dt - dt.timedelta(minutes=15)
+
+
 def market_strike_record(market):
     strike, source = extract_kalshi_start_btc(market)
     if strike is None:
@@ -847,11 +860,10 @@ def derive_successive_strike_results():
         if rec is None or not rec.get("ticker"):
             continue
 
-        # Kalshi can publish future market records before they actually open.
-        # Do not trust/use that market's strike for successive-strike inference
-        # until its real open_time has arrived.
-        next_open = parse_time(rec.get("open_time"))
-        if next_open is None or next_open > now:
+        # A Kalshi strike is usable for this method only once the actual
+        # 15-minute BTC session has begun: close_time - 15 minutes.
+        session_start = btc_session_start(market)
+        if session_start is None or session_start > now:
             continue
 
         strikes.append(rec)
@@ -859,7 +871,7 @@ def derive_successive_strike_results():
     # Deduplicate by ticker and keep chronological order.
     by_ticker = {r["ticker"]: r for r in strikes}
     strikes = list(by_ticker.values())
-    strikes.sort(key=lambda r: r.get("open_time") or "")
+    strikes.sort(key=lambda r: r.get("close_time") or "")
 
     derived = []
     for prior, nxt in zip(strikes, strikes[1:]):
@@ -1047,9 +1059,14 @@ def opposite_side(result):
 
 
 def market_age_minutes(market):
-    opened = parse_time(market.get("open_time"))
-    return None if opened is None else (utc_now() - opened).total_seconds() / 60.0
-
+    """
+    Minutes since the actual BTC 15-minute session began.
+    Future sessions return a negative age so they cannot qualify for entry.
+    """
+    session_start = btc_session_start(market)
+    if session_start is None:
+        return None
+    return (utc_now() - session_start).total_seconds() / 60.0
 
 def qualifying_current_market(open_markets):
     candidates = []
@@ -1280,14 +1297,10 @@ def cancel_demo_order(order_id):
 
 
 def market_entry_expiration_ts(market):
-    """
-    Expiration = market open time + ENTRY_WINDOW_MINUTES.
-    """
-    open_time = parse_time(market.get("open_time"))
-    if open_time is None:
-        raise ValueError("market missing open_time")
-    return int((open_time + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp())
-
+    session_start = btc_session_start(market)
+    if session_start is None:
+        return 0.0
+    return (session_start + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp()
 
 def order_fill_count(order):
     for key in ("fill_count_fp", "fill_count"):
@@ -1488,7 +1501,8 @@ def main():
         f"RETRIES={ORDER_SUBMIT_RETRIES} RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
     print("OUTCOME METHOD=successive Kalshi session strikes only")
-    print("FUTURE STRIKE GUARD=enabled; next market strike ignored until open_time")
+    print("SESSION CLOCK=close_time - 15 minutes")
+    print("FUTURE STRIKE GUARD=enabled; future sessions excluded")
     print("OFFICIAL RESULT=not used")
     print("EXTERNAL BTC SOURCES=not used")
     print(f"TRADE LOG={TRADE_LOG}")
