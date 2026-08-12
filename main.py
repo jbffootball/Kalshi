@@ -840,11 +840,21 @@ def derive_successive_strike_results():
     """
     markets = get_recent_kxbtc15m_markets_for_strikes()
     strikes = []
+    now = utc_now()
 
     for market in markets:
         rec = market_strike_record(market)
-        if rec is not None and rec.get("ticker"):
-            strikes.append(rec)
+        if rec is None or not rec.get("ticker"):
+            continue
+
+        # Kalshi can publish future market records before they actually open.
+        # Do not trust/use that market's strike for successive-strike inference
+        # until its real open_time has arrived.
+        next_open = parse_time(rec.get("open_time"))
+        if next_open is None or next_open > now:
+            continue
+
+        strikes.append(rec)
 
     # Deduplicate by ticker and keep chronological order.
     by_ticker = {r["ticker"]: r for r in strikes}
@@ -1478,6 +1488,7 @@ def main():
         f"RETRIES={ORDER_SUBMIT_RETRIES} RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
     print("OUTCOME METHOD=successive Kalshi session strikes only")
+    print("FUTURE STRIKE GUARD=enabled; next market strike ignored until open_time")
     print("OFFICIAL RESULT=not used")
     print("EXTERNAL BTC SOURCES=not used")
     print(f"TRADE LOG={TRADE_LOG}")
