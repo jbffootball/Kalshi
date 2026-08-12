@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import uuid
 import base64
 import csv
@@ -45,10 +46,45 @@ STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
 
+EXIT_LOG_POLL_SECONDS = float(os.getenv("EXIT_LOG_POLL_SECONDS", "1"))
+POSITION_PRICE_LOG = os.getenv(
+    "POSITION_PRICE_LOG", "/data/position_price_log.csv"
+)
+POSITION_SUMMARY_LOG = os.getenv(
+    "POSITION_SUMMARY_LOG", "/data/position_summary_log.csv"
+)
+
+TIME_EXIT_ENABLED = env_bool("TIME_EXIT_ENABLED", True)
+
+TAKE_PROFIT_GT3_CENTS = float(os.getenv("TAKE_PROFIT_GT3_CENTS", "95"))
+TAKE_PROFIT_2_TO_3_CENTS = float(os.getenv("TAKE_PROFIT_2_TO_3_CENTS", "90"))
+TAKE_PROFIT_1_TO_2_CENTS = float(os.getenv("TAKE_PROFIT_1_TO_2_CENTS", "85"))
+TAKE_PROFIT_LT1_CENTS = float(os.getenv("TAKE_PROFIT_LT1_CENTS", "80"))
+
+STOP_LOSS_GT3_CENTS = float(os.getenv("STOP_LOSS_GT3_CENTS", "5"))
+STOP_LOSS_2_TO_3_CENTS = float(os.getenv("STOP_LOSS_2_TO_3_CENTS", "10"))
+STOP_LOSS_1_TO_2_CENTS = float(os.getenv("STOP_LOSS_1_TO_2_CENTS", "15"))
+STOP_LOSS_LT1_CENTS = float(os.getenv("STOP_LOSS_LT1_CENTS", "20"))
+
+for _name, _value in {
+    "TAKE_PROFIT_GT3_CENTS": TAKE_PROFIT_GT3_CENTS,
+    "TAKE_PROFIT_2_TO_3_CENTS": TAKE_PROFIT_2_TO_3_CENTS,
+    "TAKE_PROFIT_1_TO_2_CENTS": TAKE_PROFIT_1_TO_2_CENTS,
+    "TAKE_PROFIT_LT1_CENTS": TAKE_PROFIT_LT1_CENTS,
+    "STOP_LOSS_GT3_CENTS": STOP_LOSS_GT3_CENTS,
+    "STOP_LOSS_2_TO_3_CENTS": STOP_LOSS_2_TO_3_CENTS,
+    "STOP_LOSS_1_TO_2_CENTS": STOP_LOSS_1_TO_2_CENTS,
+    "STOP_LOSS_LT1_CENTS": STOP_LOSS_LT1_CENTS,
+}.items():
+    if not 0 <= _value <= 100:
+        raise RuntimeError(f"{_name} must be between 0 and 100.")
+
 def env_bool(name, default=False):
     return os.getenv(name, "true" if default else "false").strip().lower() in {
         "1", "true", "yes", "on"
     }
+
+EXIT_LOGGING_ENABLED = env_bool("EXIT_LOGGING_ENABLED", True)
 
 STRATEGY_SLOTS = [
     {
@@ -1562,6 +1598,225 @@ def log_determination_delay(market, observed_at=None):
 
 
 
+
+EXIT_TRACKERS = {}
+EXIT_LOG_LOCK = threading.Lock()
+
+POSITION_PRICE_FIELDS = [
+    "timestamp_utc",
+    "ticker",
+    "slot",
+    "side",
+    "entry_cents",
+    "bid_cents",
+    "seconds_since_fill",
+    "stop_loss_setting_cents",
+    "sell_early_setting_cents",
+]
+
+POSITION_SUMMARY_FIELDS = [
+    "ticker",
+    "slot",
+    "side",
+    "fill_time_utc",
+    "entry_cents",
+    "contracts",
+    "min_bid_cents",
+    "max_bid_cents",
+    "last_bid_cents",
+    "actual_exit_reason",
+    "actual_exit_cents",
+    "actual_exit_time_utc",
+    "market_close_time_utc",
+]
+
+
+def append_exit_csv(path, fields, row):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with EXIT_LOG_LOCK:
+        new_file = not p.exists() or p.stat().st_size == 0
+        with p.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if new_file:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+def record_actual_exit(ticker, reason, exit_cents):
+    with EXIT_LOG_LOCK:
+        tracker = EXIT_TRACKERS.get(ticker)
+        if tracker is not None:
+            tracker["actual_exit_reason"] = reason
+            tracker["actual_exit_cents"] = exit_cents
+            tracker["actual_exit_time_utc"] = utc_now().isoformat(timespec="seconds")
+
+
+def exit_logging_worker(ticker):
+    with EXIT_LOG_LOCK:
+        tracker = EXIT_TRACKERS.get(ticker)
+        if tracker is None:
+            return
+        tracker = dict(tracker)
+
+    fill_dt = parse_time(tracker["fill_time_utc"])
+    min_bid = None
+    max_bid = None
+    last_bid = None
+
+    while True:
+        try:
+            market = get_market_by_ticker(ticker)
+            now = utc_now()
+
+            if market:
+                close_dt = parse_time(market.get("close_time"))
+                bid = side_bid_cents(market, tracker["side"])
+
+                if bid is not None:
+                    min_bid = bid if min_bid is None else min(min_bid, bid)
+                    max_bid = bid if max_bid is None else max(max_bid, bid)
+                    last_bid = bid
+
+                    elapsed = (
+                        (now - fill_dt).total_seconds()
+                        if fill_dt is not None else ""
+                    )
+
+                    append_exit_csv(
+                        POSITION_PRICE_LOG,
+                        POSITION_PRICE_FIELDS,
+                        {
+                            "timestamp_utc": now.isoformat(timespec="seconds"),
+                            "ticker": ticker,
+                            "slot": tracker.get("slot", ""),
+                            "side": tracker["side"],
+                            "entry_cents": tracker["entry_cents"],
+                            "bid_cents": bid,
+                            "seconds_since_fill": elapsed,
+                            "stop_loss_setting_cents": STOP_LOSS_CENTS,
+                            "sell_early_setting_cents": SELL_EARLY_CENTS,
+                        },
+                    )
+
+                if close_dt is not None and now >= close_dt:
+                    with EXIT_LOG_LOCK:
+                        live = EXIT_TRACKERS.get(ticker, {})
+                        actual_reason = live.get("actual_exit_reason", "")
+                        actual_cents = live.get("actual_exit_cents", "")
+                        actual_time = live.get("actual_exit_time_utc", "")
+
+                    append_exit_csv(
+                        POSITION_SUMMARY_LOG,
+                        POSITION_SUMMARY_FIELDS,
+                        {
+                            "ticker": ticker,
+                            "slot": tracker.get("slot", ""),
+                            "side": tracker["side"],
+                            "fill_time_utc": tracker["fill_time_utc"],
+                            "entry_cents": tracker["entry_cents"],
+                            "contracts": tracker["contracts"],
+                            "min_bid_cents": "" if min_bid is None else min_bid,
+                            "max_bid_cents": "" if max_bid is None else max_bid,
+                            "last_bid_cents": "" if last_bid is None else last_bid,
+                            "actual_exit_reason": actual_reason,
+                            "actual_exit_cents": actual_cents,
+                            "actual_exit_time_utc": actual_time,
+                            "market_close_time_utc": market.get("close_time", ""),
+                        },
+                    )
+
+                    print(
+                        f"EXIT LOG COMPLETE: {ticker} "
+                        f"min_bid={min_bid}c max_bid={max_bid}c"
+                    )
+                    break
+
+        except Exception as exc:
+            print(f"EXIT LOG WARNING {ticker}: {exc!r}")
+
+        time.sleep(max(0.5, EXIT_LOG_POLL_SECONDS))
+
+    with EXIT_LOG_LOCK:
+        EXIT_TRACKERS.pop(ticker, None)
+
+
+def start_exit_logging(ticker, slot, side, entry_cents, contracts):
+    if not EXIT_LOGGING_ENABLED:
+        return
+
+    tracker = {
+        "ticker": ticker,
+        "slot": slot or "",
+        "side": side,
+        "entry_cents": float(entry_cents),
+        "contracts": float(contracts),
+        "fill_time_utc": utc_now().isoformat(timespec="seconds"),
+        "actual_exit_reason": "",
+        "actual_exit_cents": "",
+        "actual_exit_time_utc": "",
+    }
+
+    with EXIT_LOG_LOCK:
+        if ticker in EXIT_TRACKERS:
+            return
+        EXIT_TRACKERS[ticker] = tracker
+
+    print(
+        f"EXIT LOG STARTED: {ticker} slot={slot or '-'} "
+        f"{side.upper()} entry={float(entry_cents):.1f}c"
+    )
+
+    thread = threading.Thread(
+        target=exit_logging_worker,
+        args=(ticker,),
+        daemon=True,
+        name=f"exit-log-{ticker}",
+    )
+    thread.start()
+
+
+
+def time_exit_thresholds(market):
+    """
+    Return (stop_loss_cents, take_profit_cents, minutes_remaining, band_name)
+    for the current 15-minute contract.
+    """
+    close_dt = parse_time(market.get("close_time"))
+    if close_dt is None:
+        return None, None, None, "unknown"
+
+    minutes_remaining = (close_dt - utc_now()).total_seconds() / 60.0
+
+    if minutes_remaining > 3:
+        return (
+            STOP_LOSS_GT3_CENTS,
+            TAKE_PROFIT_GT3_CENTS,
+            minutes_remaining,
+            ">3m",
+        )
+    if minutes_remaining > 2:
+        return (
+            STOP_LOSS_2_TO_3_CENTS,
+            TAKE_PROFIT_2_TO_3_CENTS,
+            minutes_remaining,
+            "2-3m",
+        )
+    if minutes_remaining > 1:
+        return (
+            STOP_LOSS_1_TO_2_CENTS,
+            TAKE_PROFIT_1_TO_2_CENTS,
+            minutes_remaining,
+            "1-2m",
+        )
+    return (
+        STOP_LOSS_LT1_CENTS,
+        TAKE_PROFIT_LT1_CENTS,
+        minutes_remaining,
+        "<1m",
+    )
+
+
 def side_bid_cents(market, held_side):
     """
     Executable value of the position: the best displayed bid for the exact
@@ -1644,13 +1899,42 @@ def monitor_position_once(position):
         return "hold", position
 
     entry = float(position["entry_cents"])
-    stop_hit = STOP_LOSS_CENTS > 0 and bid <= STOP_LOSS_CENTS
-    early_hit = SELL_EARLY_CENTS < 100 and bid >= SELL_EARLY_CENTS
+
+    if TIME_EXIT_ENABLED:
+        stop_threshold, early_threshold, minutes_remaining, time_band = (
+            time_exit_thresholds(market)
+        )
+        stop_hit = (
+            stop_threshold is not None
+            and stop_threshold > 0
+            and bid <= stop_threshold
+        )
+        early_hit = (
+            early_threshold is not None
+            and early_threshold < 100
+            and bid >= early_threshold
+        )
+    else:
+        stop_threshold = STOP_LOSS_CENTS
+        early_threshold = SELL_EARLY_CENTS
+        minutes_remaining = (
+            (close_dt - utc_now()).total_seconds() / 60.0
+            if close_dt is not None else None
+        )
+        time_band = "fixed"
+        stop_hit = STOP_LOSS_CENTS > 0 and bid <= STOP_LOSS_CENTS
+        early_hit = SELL_EARLY_CENTS < 100 and bid >= SELL_EARLY_CENTS
+
+    remaining_text = (
+        f"{minutes_remaining:.2f}m"
+        if minutes_remaining is not None else "?"
+    )
 
     print(
         f"POSITION: {ticker} {held_side.upper()} qty={qty:g} "
-        f"entry={entry:.1f}c bid={bid:.1f}c "
-        f"stop={STOP_LOSS_CENTS:g}c early={SELL_EARLY_CENTS:g}c"
+        f"entry={entry:.1f}c bid={bid:.1f}c remaining={remaining_text} "
+        f"band={time_band} stop={stop_threshold:g}c "
+        f"take={early_threshold:g}c"
     )
 
     if not stop_hit and not early_hit:
@@ -1681,6 +1965,9 @@ def monitor_position_once(position):
         f"qty={exited:g} at ~{exit_cents:.1f}c "
         f"trade_pnl={pnl_cents:.1f}c remaining={remaining:g}"
     )
+
+    reason_key = "stop_loss" if stop_hit else "sell_early"
+    record_actual_exit(ticker, reason_key, exit_cents)
 
     if remaining <= 0.000001:
         return "closed", None
@@ -1721,6 +2008,19 @@ def main():
     )
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
+    print(
+        f"EXIT LOGGING={'ON' if EXIT_LOGGING_ENABLED else 'OFF'} "
+        f"poll={EXIT_LOG_POLL_SECONDS:g}s"
+    )
+    print(
+        f"TIME EXITS={'ON' if TIME_EXIT_ENABLED else 'OFF'} | "
+        f">3m stop/take={STOP_LOSS_GT3_CENTS:g}/{TAKE_PROFIT_GT3_CENTS:g}c | "
+        f"2-3m={STOP_LOSS_2_TO_3_CENTS:g}/{TAKE_PROFIT_2_TO_3_CENTS:g}c | "
+        f"1-2m={STOP_LOSS_1_TO_2_CENTS:g}/{TAKE_PROFIT_1_TO_2_CENTS:g}c | "
+        f"<1m={STOP_LOSS_LT1_CENTS:g}/{TAKE_PROFIT_LT1_CENTS:g}c"
+    )
+    print(f"POSITION PRICE LOG={POSITION_PRICE_LOG}")
+    print(f"POSITION SUMMARY LOG={POSITION_SUMMARY_LOG}")
 
     completed_markets = logged_tickers()
     current_order = None
@@ -1792,8 +2092,15 @@ def main():
                         "entry_cents": fill_cents,
                         "contracts": filled,
                     }
+                    start_exit_logging(
+                        ticker,
+                        current_order.get("slot", ""),
+                        side,
+                        fill_cents,
+                        filled,
+                    )
                     current_order = None
-                    if STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                    if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
                         print(
                             f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
                             f"qty={filled:g} entry={fill_cents:.1f}c"
@@ -1903,13 +2210,20 @@ def main():
                 )
                 log_signal(ticker, last_result, streak, side, fill_cents, age, contracts)
                 completed_markets.add(ticker)
-                if STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
                     current_position = {
                         "ticker": ticker,
                         "side": side,
                         "entry_cents": fill_cents,
                         "contracts": filled,
                     }
+                    start_exit_logging(
+                        ticker,
+                        slot_name,
+                        side,
+                        fill_cents,
+                        filled,
+                    )
                     print(
                         f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
                         f"qty={filled:g} entry={fill_cents:.1f}c"
