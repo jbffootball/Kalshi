@@ -41,6 +41,64 @@ ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
 RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "1"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 MAX_CLOSE_CAPTURE_LAG_SECONDS = float(os.getenv("MAX_CLOSE_CAPTURE_LAG_SECONDS", "3"))
+STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
+SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
+POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
+
+def env_bool(name, default=False):
+    return os.getenv(name, "true" if default else "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+STRATEGY_SLOTS = [
+    {
+        "name": "A",
+        "enabled": env_bool("STREAK_A_ENABLED", True),
+        "streak": int(os.getenv("STREAK_A_LENGTH", "2")),
+        "max_entry_cents": int(os.getenv("STREAK_A_MAX_ENTRY_CENTS", "35")),
+        "entry_window_minutes": float(os.getenv("STREAK_A_ENTRY_WINDOW_MINUTES", "3")),
+        "contracts": float(os.getenv("STREAK_A_CONTRACTS", "1")),
+    },
+    {
+        "name": "B",
+        "enabled": env_bool("STREAK_B_ENABLED", True),
+        "streak": int(os.getenv("STREAK_B_LENGTH", "3")),
+        "max_entry_cents": int(os.getenv("STREAK_B_MAX_ENTRY_CENTS", "40")),
+        "entry_window_minutes": float(os.getenv("STREAK_B_ENTRY_WINDOW_MINUTES", "4")),
+        "contracts": float(os.getenv("STREAK_B_CONTRACTS", "1")),
+    },
+    {
+        "name": "C",
+        "enabled": env_bool("STREAK_C_ENABLED", True),
+        "streak": int(os.getenv("STREAK_C_LENGTH", "5")),
+        "max_entry_cents": int(os.getenv("STREAK_C_MAX_ENTRY_CENTS", "45")),
+        "entry_window_minutes": float(os.getenv("STREAK_C_ENTRY_WINDOW_MINUTES", "5")),
+        "contracts": float(os.getenv("STREAK_C_CONTRACTS", "1")),
+    },
+]
+
+for slot in STRATEGY_SLOTS:
+    if slot["streak"] < 1:
+        raise RuntimeError(f'STREAK_{slot["name"]}_LENGTH must be >= 1')
+    if not 1 <= slot["max_entry_cents"] <= 99:
+        raise RuntimeError(
+            f'STREAK_{slot["name"]}_MAX_ENTRY_CENTS must be between 1 and 99'
+        )
+    if not 0 < slot["entry_window_minutes"] <= 15:
+        raise RuntimeError(
+            f'STREAK_{slot["name"]}_ENTRY_WINDOW_MINUTES must be >0 and <=15'
+        )
+    if slot["contracts"] <= 0:
+        raise RuntimeError(f'STREAK_{slot["name"]}_CONTRACTS must be > 0')
+
+enabled_lengths = [s["streak"] for s in STRATEGY_SLOTS if s["enabled"]]
+if len(enabled_lengths) != len(set(enabled_lengths)):
+    raise RuntimeError("Enabled streak slots must use different streak lengths.")
+
+if not 0 <= STOP_LOSS_CENTS <= 99:
+    raise RuntimeError("STOP_LOSS_CENTS must be between 0 and 99; use 0 to disable.")
+if not 1 <= SELL_EARLY_CENTS <= 100:
+    raise RuntimeError("SELL_EARLY_CENTS must be between 1 and 100; use 100 to disable.")
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
 # RAILWAY_VOLUME_MOUNT_PATH automatically. Otherwise, fall back to ./data.
@@ -1054,6 +1112,18 @@ def calculate_streak(markets):
     return latest, count
 
 
+
+def strategy_for_streak(streak):
+    """
+    Exact-match strategy selection.
+    Example: if A=2, B=3, C=5, streak 4 produces no trade.
+    """
+    for slot in STRATEGY_SLOTS:
+        if slot["enabled"] and streak == slot["streak"]:
+            return slot
+    return None
+
+
 def opposite_side(result):
     return "no" if result == "yes" else "yes"
 
@@ -1068,11 +1138,11 @@ def market_age_minutes(market):
         return None
     return (utc_now() - session_start).total_seconds() / 60.0
 
-def qualifying_current_market(open_markets):
+def qualifying_current_market(open_markets, entry_window_minutes):
     candidates = []
     for m in open_markets:
         age = market_age_minutes(m)
-        if age is not None and 0 <= age <= ENTRY_WINDOW_MINUTES:
+        if age is not None and 0 <= age <= entry_window_minutes:
             candidates.append((age, m))
     if not candidates:
         return None
@@ -1161,7 +1231,7 @@ def logged_tickers():
     return {r["ticker"] for r in read_trade_log() if r.get("ticker")}
 
 
-def log_signal(ticker, trigger_result, streak, side, entry_cents, age_minutes):
+def log_signal(ticker, trigger_result, streak, side, entry_cents, age_minutes, contracts=None):
     rows = read_trade_log()
     if any(r.get("ticker") == ticker for r in rows):
         return
@@ -1173,7 +1243,7 @@ def log_signal(ticker, trigger_result, streak, side, entry_cents, age_minutes):
         "side": side,
         "entry_cents": f"{float(entry_cents):.4f}",
         "market_age_minutes": f"{float(age_minutes):.4f}",
-        "contracts": f"{CONTRACTS:.4f}",
+        "contracts": f"{float(CONTRACTS if contracts is None else contracts):.4f}",
         "status": "PENDING",
         "settlement": "",
         "won": "",
@@ -1241,7 +1311,7 @@ def print_summary(rows=None):
 
 
 
-def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts):
+def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts, contracts):
     """
     Place one resting limit order that expires automatically at the end of
     the configured entry window.
@@ -1267,7 +1337,7 @@ def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts):
         "ticker": ticker,
         "client_order_id": client_order_id,
         "side": book_side,
-        "count": f"{CONTRACTS:.2f}",
+        "count": f"{contracts:.2f}",
         "price": f"{price_dollars:.4f}",
         "time_in_force": "good_till_canceled",
         "expiration_time": int(expiration_ts),
@@ -1296,11 +1366,13 @@ def cancel_demo_order(order_id):
         return None
 
 
-def market_entry_expiration_ts(market):
+def market_entry_expiration_ts(market, entry_window_minutes):
     session_start = btc_session_start(market)
     if session_start is None:
         return 0.0
-    return (session_start + dt.timedelta(minutes=ENTRY_WINDOW_MINUTES)).timestamp()
+    return (
+        session_start + dt.timedelta(minutes=entry_window_minutes)
+    ).timestamp()
 
 def order_fill_count(order):
     for key in ("fill_count_fp", "fill_count"):
@@ -1320,7 +1392,7 @@ def order_remaining_count(order):
     return 0.0
 
 
-def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts):
+def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, contracts):
     """
     Try to submit the resting limit order up to ORDER_SUBMIT_RETRIES times.
     Stop immediately once Kalshi accepts an order. Never retry after the
@@ -1343,7 +1415,7 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts):
                 f"{ticker} {side.upper()} @ {limit_cents}c"
             )
             order = place_demo_resting_limit_order(
-                ticker, side, limit_cents, expiration_ts
+                ticker, side, limit_cents, expiration_ts, contracts
             )
             print(
                 f"SUBMIT ACCEPTED on attempt {attempt}: "
@@ -1489,27 +1561,170 @@ def log_determination_delay(market, observed_at=None):
     print(f"DETERMINATION DELAY: {delay:.3f} seconds")
 
 
+
+def side_bid_cents(market, held_side):
+    """
+    Executable value of the position: the best displayed bid for the exact
+    contract we hold (YES or NO).
+    """
+    field = "yes_bid_dollars" if held_side == "yes" else "no_bid_dollars"
+    return dollars_to_cents(market.get(field))
+
+
+def submit_demo_exit_ioc(ticker, held_side, contracts, side_bid):
+    """
+    Exit an existing position using an immediate-or-cancel reduce-only order
+    priced at the current executable bid for the held contract.
+
+    V2 event orders are represented on the YES book:
+      - Sell YES -> ask YES at YES bid.
+      - Sell NO  -> buy YES at 1 - NO bid.
+    """
+    if MODE != "demo":
+        raise RuntimeError("Exit orders require MODE=demo")
+    if not PLACE_ORDERS:
+        raise RuntimeError("PLACE_DEMO_ORDERS is false")
+
+    if held_side == "yes":
+        book_side = "ask"
+        yes_book_price = side_bid / 100.0
+    elif held_side == "no":
+        book_side = "bid"
+        yes_book_price = 1.0 - (side_bid / 100.0)
+    else:
+        raise ValueError(f"Unknown held side: {held_side}")
+
+    payload = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": book_side,
+        "count": f"{float(contracts):.2f}",
+        "price": f"{yes_book_price:.4f}",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "cancel_order_on_pause": True,
+        "reduce_only": True,
+        "subaccount": 0,
+        "exchange_index": 0,
+    }
+
+    resp = authenticated_request(
+        "POST", "/portfolio/events/orders", json_body=payload
+    )
+    return resp.get("order", resp)
+
+
+def monitor_position_once(position):
+    """
+    Check one filled position against the Railway-configured stop-loss and
+    early-sell thresholds. Returns:
+      ("hold", position)
+      ("closed", None)
+      ("partial", updated_position)
+      ("expired", None)
+    """
+    ticker = position["ticker"]
+    held_side = position["side"]
+    qty = float(position["contracts"])
+
+    market = get_market_by_ticker(ticker)
+    if not market:
+        print(f"POSITION WARNING: could not load market {ticker}; holding.")
+        return "hold", position
+
+    # Once the 15-minute market itself is over, do not submit a late exit.
+    close_dt = parse_time(market.get("close_time"))
+    if close_dt is not None and utc_now() >= close_dt:
+        print(f"POSITION WINDOW CLOSED: {ticker}; no early exit submitted.")
+        return "expired", None
+
+    bid = side_bid_cents(market, held_side)
+    if bid is None:
+        print(f"POSITION: {ticker} {held_side.upper()} no executable bid; holding.")
+        return "hold", position
+
+    entry = float(position["entry_cents"])
+    stop_hit = STOP_LOSS_CENTS > 0 and bid <= STOP_LOSS_CENTS
+    early_hit = SELL_EARLY_CENTS < 100 and bid >= SELL_EARLY_CENTS
+
+    print(
+        f"POSITION: {ticker} {held_side.upper()} qty={qty:g} "
+        f"entry={entry:.1f}c bid={bid:.1f}c "
+        f"stop={STOP_LOSS_CENTS:g}c early={SELL_EARLY_CENTS:g}c"
+    )
+
+    if not stop_hit and not early_hit:
+        return "hold", position
+
+    reason = "STOP LOSS" if stop_hit else "SELL EARLY"
+    print(
+        f"{reason} TRIGGERED: {ticker} {held_side.upper()} "
+        f"bid={bid:.1f}c qty={qty:g}"
+    )
+
+    exit_order = submit_demo_exit_ioc(ticker, held_side, qty, bid)
+    exited = order_fill_count(exit_order)
+
+    if exited <= 0:
+        print(
+            f"{reason} EXIT NOT FILLED: {ticker}; "
+            f"will re-check on next position poll."
+        )
+        return "hold", position
+
+    exit_cents = actual_fill_cents(exit_order, held_side, bid)
+    remaining = max(0.0, qty - exited)
+    pnl_cents = (exit_cents - entry) * exited
+
+    print(
+        f"{reason} EXIT FILLED: {ticker} {held_side.upper()} "
+        f"qty={exited:g} at ~{exit_cents:.1f}c "
+        f"trade_pnl={pnl_cents:.1f}c remaining={remaining:g}"
+    )
+
+    if remaining <= 0.000001:
+        return "closed", None
+
+    updated = dict(position)
+    updated["contracts"] = remaining
+    return "partial", updated
+
+
 def main():
     ensure_trade_log()
     ensure_session_log()
 
     print("KALSHI BTC 15-MINUTE STREAK BOT")
     print(
-        f"MODE={MODE} SERIES={SERIES} STREAK={STREAK_TRIGGER} "
-        f"CAP={MAX_ENTRY_CENTS}c WINDOW={ENTRY_WINDOW_MINUTES}m "
+        f"MODE={MODE} SERIES={SERIES} "
         f"ORDER_POLL={POLL_ORDER_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s "
         f"RETRIES={ORDER_SUBMIT_RETRIES} RETRY_WAIT={ORDER_RETRY_SECONDS}s"
     )
+    for slot in STRATEGY_SLOTS:
+        state = "ON" if slot["enabled"] else "OFF"
+        print(
+            f"SLOT {slot['name']}={state} streak={slot['streak']} "
+            f"max_entry={slot['max_entry_cents']}c "
+            f"window={slot['entry_window_minutes']:g}m "
+            f"contracts={slot['contracts']:g}"
+        )
     print("OUTCOME METHOD=successive Kalshi session strikes only")
     print("SESSION CLOCK=close_time - 15 minutes")
     print("FUTURE STRIKE GUARD=enabled; future sessions excluded")
     print("OFFICIAL RESULT=not used")
     print("EXTERNAL BTC SOURCES=not used")
+    print(
+        f"EXITS: STOP_LOSS_CENTS={STOP_LOSS_CENTS:g} "
+        f"SELL_EARLY_CENTS={SELL_EARLY_CENTS:g} "
+        f"POSITION_POLL={POLL_POSITION_SECONDS:g}s "
+        "(STOP=0 disables stop; EARLY=100 disables early sell)"
+    )
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
 
     completed_markets = logged_tickers()
     current_order = None
+    current_position = None
     last_sequence_ticker = None
 
     print_summary()
@@ -1528,6 +1743,15 @@ def main():
 
             last_result, streak = calculate_streak(immediate_markets)
             print(f"CALCULATED IMMEDIATE: last={last_result} streak={streak}")
+
+            # Manage a filled position before looking for any new entry.
+            if current_position is not None:
+                action, current_position = monitor_position_once(current_position)
+                if action in {"closed", "expired"}:
+                    sleep_idle()
+                else:
+                    time.sleep(POLL_POSITION_SECONDS)
+                continue
 
             # Manage any already accepted resting order.
             if current_order is not None:
@@ -1559,10 +1783,26 @@ def main():
                         side,
                         fill_cents,
                         current_order["age_at_submit"],
+                        current_order["contracts"],
                     )
                     completed_markets.add(ticker)
+                    current_position = {
+                        "ticker": ticker,
+                        "side": side,
+                        "entry_cents": fill_cents,
+                        "contracts": filled,
+                    }
                     current_order = None
-                    sleep_idle()
+                    if STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                        print(
+                            f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
+                            f"qty={filled:g} entry={fill_cents:.1f}c"
+                        )
+                        time.sleep(POLL_POSITION_SECONDS)
+                    else:
+                        print("POSITION EXITS DISABLED; holding to market close.")
+                        current_position = None
+                        sleep_idle()
                     continue
 
                 if status in {"canceled", "executed"} or remaining <= 0:
@@ -1582,13 +1822,27 @@ def main():
                 continue
 
             # TIE/FLAG deliberately breaks the streak.
-            if last_result not in {"yes", "no"} or streak < STREAK_TRIGGER:
+            if last_result not in {"yes", "no"}:
                 sleep_idle()
                 continue
 
-            market = qualifying_current_market(get_open_markets())
+            strategy = strategy_for_streak(streak)
+            if strategy is None:
+                print(f"NO SLOT MATCH: streak={streak}; no order.")
+                sleep_idle()
+                continue
+
+            entry_window = strategy["entry_window_minutes"]
+            contracts = strategy["contracts"]
+            limit_cents = strategy["max_entry_cents"]
+            slot_name = strategy["name"]
+
+            market = qualifying_current_market(get_open_markets(), entry_window)
             if market is None:
-                print("No qualifying market inside entry window; waiting for next session.")
+                print(
+                    f"SLOT {slot_name}: no qualifying market inside "
+                    f"{entry_window:g}m entry window."
+                )
                 sleep_idle()
                 continue
 
@@ -1601,35 +1855,35 @@ def main():
                 sleep_idle()
                 continue
 
-            limit_cents = MAX_ENTRY_CENTS
-            expiration_ts = market_entry_expiration_ts(market)
+            expiration_ts = market_entry_expiration_ts(market, entry_window)
 
             if utc_now().timestamp() >= expiration_ts:
-                print(f"SKIP: entry window already expired for {ticker}.")
+                print(f"SKIP: SLOT {slot_name} entry window expired for {ticker}.")
                 sleep_idle()
                 continue
 
             print(
-                f"PLACE LIMIT: {ticker} buy {side.upper()} "
-                f"{CONTRACTS:g} @ {limit_cents}c age={age:.2f}m"
+                f"PLACE LIMIT SLOT {slot_name}: {ticker} buy {side.upper()} "
+                f"{contracts:g} @ {limit_cents}c age={age:.2f}m "
+                f"streak={streak}"
             )
 
             if MODE == "paper":
                 print("PAPER LIMIT SIGNAL ONLY â no order sent.")
-                log_signal(ticker, last_result, streak, side, limit_cents, age)
+                log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
                 completed_markets.add(ticker)
                 sleep_idle()
                 continue
 
             if not PLACE_ORDERS:
                 print("DEMO limit signal only â PLACE_DEMO_ORDERS=false.")
-                log_signal(ticker, last_result, streak, side, limit_cents, age)
+                log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
                 completed_markets.add(ticker)
                 sleep_idle()
                 continue
 
             order = submit_resting_order_with_retry(
-                ticker, side, limit_cents, expiration_ts
+                ticker, side, limit_cents, expiration_ts, contracts
             )
 
             if order is None:
@@ -1647,9 +1901,23 @@ def main():
                     f"IMMEDIATE FILL: {ticker} {side.upper()} qty={filled:g} "
                     f"at ~{fill_cents:.1f}c. MARKET LOCKED."
                 )
-                log_signal(ticker, last_result, streak, side, fill_cents, age)
+                log_signal(ticker, last_result, streak, side, fill_cents, age, contracts)
                 completed_markets.add(ticker)
-                sleep_idle()
+                if STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                    current_position = {
+                        "ticker": ticker,
+                        "side": side,
+                        "entry_cents": fill_cents,
+                        "contracts": filled,
+                    }
+                    print(
+                        f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
+                        f"qty={filled:g} entry={fill_cents:.1f}c"
+                    )
+                    time.sleep(POLL_POSITION_SECONDS)
+                else:
+                    print("POSITION EXITS DISABLED; holding to market close.")
+                    sleep_idle()
                 continue
 
             current_order = {
@@ -1661,10 +1929,13 @@ def main():
                 "trigger_result": last_result,
                 "trigger_streak": streak,
                 "age_at_submit": age,
+                "contracts": contracts,
+                "slot": slot_name,
             }
 
             print(
-                f"ORDER RESTING: {ticker} {side.upper()} @ {limit_cents}c. "
+                f"ORDER RESTING SLOT {slot_name}: {ticker} {side.upper()} "
+                f"{contracts:g} @ {limit_cents}c. "
                 f"Monitoring every {POLL_ORDER_SECONDS:g}s."
             )
             time.sleep(POLL_ORDER_SECONDS)
