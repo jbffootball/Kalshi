@@ -54,6 +54,10 @@ POSITION_SUMMARY_LOG = os.getenv(
     "POSITION_SUMMARY_LOG", "/data/position_summary_log.csv"
 )
 
+PERFORMANCE_LOG = os.getenv(
+    "PERFORMANCE_LOG", "/data/current_strategy_performance.csv"
+)
+
 TAKE_PROFIT_GT3_CENTS = float(os.getenv("TAKE_PROFIT_GT3_CENTS", "95"))
 TAKE_PROFIT_2_TO_3_CENTS = float(os.getenv("TAKE_PROFIT_2_TO_3_CENTS", "90"))
 TAKE_PROFIT_1_TO_2_CENTS = float(os.getenv("TAKE_PROFIT_1_TO_2_CENTS", "85"))
@@ -340,6 +344,7 @@ def ensure_session_log():
 
 def read_session_log():
     ensure_session_log()
+    ensure_performance_log()
     with open(SESSION_LOG, "r", newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
@@ -1147,6 +1152,206 @@ def calculate_streak(markets):
             break
     return latest, count
 
+
+
+
+PERFORMANCE_FIELDS = [
+    "fill_time_utc",
+    "ticker",
+    "slot",
+    "trigger_streak",
+    "side",
+    "entry_cents",
+    "contracts",
+    "status",
+    "exit_reason",
+    "exit_cents",
+    "settlement_result",
+    "pnl_cents",
+    "outcome",
+    "closed_time_utc",
+]
+
+
+def ensure_performance_log():
+    p = Path(PERFORMANCE_LOG)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists() or p.stat().st_size == 0:
+        with p.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=PERFORMANCE_FIELDS).writeheader()
+
+
+def read_performance_log():
+    ensure_performance_log()
+    with Path(PERFORMANCE_LOG).open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def write_performance_log(rows):
+    ensure_performance_log()
+    with Path(PERFORMANCE_LOG).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PERFORMANCE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def performance_start_trade(
+    ticker, slot, trigger_streak, side, entry_cents, contracts
+):
+    rows = read_performance_log()
+    if any(r.get("ticker") == ticker for r in rows):
+        return
+
+    rows.append({
+        "fill_time_utc": utc_now().isoformat(timespec="seconds"),
+        "ticker": ticker,
+        "slot": slot or "",
+        "trigger_streak": str(trigger_streak),
+        "side": side,
+        "entry_cents": f"{float(entry_cents):.4f}",
+        "contracts": f"{float(contracts):.4f}",
+        "status": "OPEN",
+        "exit_reason": "",
+        "exit_cents": "",
+        "settlement_result": "",
+        "pnl_cents": "",
+        "outcome": "",
+        "closed_time_utc": "",
+    })
+    write_performance_log(rows)
+    print(
+        f"PERFORMANCE TRACKED: {ticker} slot={slot or '-'} "
+        f"{side.upper()} entry={float(entry_cents):.1f}c"
+    )
+
+
+def performance_close_exit(ticker, exit_reason, exit_cents):
+    rows = read_performance_log()
+    changed = False
+
+    for r in rows:
+        if r.get("ticker") != ticker or r.get("status") != "OPEN":
+            continue
+
+        entry = float(r.get("entry_cents") or 0)
+        qty = float(r.get("contracts") or 0)
+        exit_price = float(exit_cents)
+        pnl = (exit_price - entry) * qty
+
+        r["status"] = "CLOSED"
+        r["exit_reason"] = exit_reason
+        r["exit_cents"] = f"{exit_price:.4f}"
+        r["pnl_cents"] = f"{pnl:.4f}"
+        r["outcome"] = (
+            "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "BREAKEVEN"
+        )
+        r["closed_time_utc"] = utc_now().isoformat(timespec="seconds")
+        changed = True
+        break
+
+    if changed:
+        write_performance_log(rows)
+        print_current_strategy_summary(rows)
+
+
+def performance_settle_held_trades(immediate_markets):
+    """
+    Close trades still held at market end using our Kalshi successive-strike
+    result, not Kalshi's official result.
+    """
+    result_by_ticker = {
+        m.get("ticker"): (m.get("result") or "").lower()
+        for m in immediate_markets
+        if m.get("ticker") and (m.get("result") or "").lower() in {"yes", "no"}
+    }
+
+    rows = read_performance_log()
+    changed = False
+
+    for r in rows:
+        if r.get("status") != "OPEN":
+            continue
+
+        settlement = result_by_ticker.get(r.get("ticker"))
+        if settlement not in {"yes", "no"}:
+            continue
+
+        side = (r.get("side") or "").lower()
+        entry = float(r.get("entry_cents") or 0)
+        qty = float(r.get("contracts") or 0)
+        won = settlement == side
+        pnl = ((100.0 - entry) if won else -entry) * qty
+
+        r["status"] = "CLOSED"
+        r["exit_reason"] = "held_to_close"
+        r["exit_cents"] = "100.0000" if won else "0.0000"
+        r["settlement_result"] = settlement
+        r["pnl_cents"] = f"{pnl:.4f}"
+        r["outcome"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "BREAKEVEN"
+        r["closed_time_utc"] = utc_now().isoformat(timespec="seconds")
+        changed = True
+
+        print(
+            f"PERFORMANCE CLOSED: {r['ticker']} held_to_close "
+            f"{r['outcome']} pnl={pnl:.1f}c"
+        )
+
+    if changed:
+        write_performance_log(rows)
+        print_current_strategy_summary(rows)
+
+
+def _summary_stats(rows):
+    closed = [r for r in rows if r.get("status") == "CLOSED"]
+    open_rows = [r for r in rows if r.get("status") == "OPEN"]
+    wins = sum(1 for r in closed if r.get("outcome") == "WIN")
+    losses = sum(1 for r in closed if r.get("outcome") == "LOSS")
+    breakeven = sum(1 for r in closed if r.get("outcome") == "BREAKEVEN")
+    pnl = sum(float(r.get("pnl_cents") or 0) for r in closed)
+    decided = wins + losses
+    win_rate = (100.0 * wins / decided) if decided else None
+    avg_pnl = (pnl / len(closed)) if closed else None
+
+    return {
+        "closed": len(closed),
+        "open": len(open_rows),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate": win_rate,
+        "pnl": pnl,
+        "avg_pnl": avg_pnl,
+    }
+
+
+def print_current_strategy_summary(rows=None):
+    if rows is None:
+        rows = read_performance_log()
+
+    s = _summary_stats(rows)
+    wr = f"{s['win_rate']:.1f}%" if s["win_rate"] is not None else "--"
+    avg = f"{s['avg_pnl']:.1f}c" if s["avg_pnl"] is not None else "--"
+
+    print(
+        "CURRENT STRATEGY SUMMARY: "
+        f"closed={s['closed']} open={s['open']} "
+        f"wins={s['wins']} losses={s['losses']} "
+        f"win_rate={wr} net_pnl={s['pnl']:.1f}c "
+        f"avg_pnl_per_trade={avg}"
+    )
+
+    for slot in ("A", "B", "C"):
+        slot_rows = [r for r in rows if r.get("slot") == slot]
+        if not slot_rows:
+            continue
+        ss = _summary_stats(slot_rows)
+        swr = f"{ss['win_rate']:.1f}%" if ss["win_rate"] is not None else "--"
+        savg = f"{ss['avg_pnl']:.1f}c" if ss["avg_pnl"] is not None else "--"
+        print(
+            f"  SLOT {slot}: closed={ss['closed']} open={ss['open']} "
+            f"W={ss['wins']} L={ss['losses']} win_rate={swr} "
+            f"net_pnl={ss['pnl']:.1f}c avg={savg}"
+        )
 
 
 def strategy_for_streak(streak):
@@ -1968,6 +2173,7 @@ def monitor_position_once(position):
 
     reason_key = "stop_loss" if stop_hit else "sell_early"
     record_actual_exit(ticker, reason_key, exit_cents)
+    performance_close_exit(ticker, reason_key, exit_cents)
 
     if remaining <= 0.000001:
         return "closed", None
@@ -2021,18 +2227,20 @@ def main():
     )
     print(f"POSITION PRICE LOG={POSITION_PRICE_LOG}")
     print(f"POSITION SUMMARY LOG={POSITION_SUMMARY_LOG}")
+    print(f"PERFORMANCE LOG={PERFORMANCE_LOG}")
 
     completed_markets = logged_tickers()
     current_order = None
     current_position = None
     last_sequence_ticker = None
 
-    print_summary()
+    print_current_strategy_summary()
 
     while True:
         try:
             # Build the immediate streak strictly from adjacent Kalshi strikes.
             immediate_markets = successive_strike_markets()
+            performance_settle_held_trades(immediate_markets)
 
             newest_ticker = (
                 immediate_markets[-1].get("ticker") if immediate_markets else None
@@ -2084,6 +2292,14 @@ def main():
                         fill_cents,
                         current_order["age_at_submit"],
                         current_order["contracts"],
+                    )
+                    performance_start_trade(
+                        ticker,
+                        current_order.get("slot", ""),
+                        current_order["trigger_streak"],
+                        side,
+                        fill_cents,
+                        filled,
                     )
                     completed_markets.add(ticker)
                     current_position = {
@@ -2209,6 +2425,14 @@ def main():
                     f"at ~{fill_cents:.1f}c. MARKET LOCKED."
                 )
                 log_signal(ticker, last_result, streak, side, fill_cents, age, contracts)
+                performance_start_trade(
+                    ticker,
+                    slot_name,
+                    streak,
+                    side,
+                    fill_cents,
+                    filled,
+                )
                 completed_markets.add(ticker)
                 if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
                     current_position = {
