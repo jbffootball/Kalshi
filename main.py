@@ -54,8 +54,6 @@ POSITION_SUMMARY_LOG = os.getenv(
     "POSITION_SUMMARY_LOG", "/data/position_summary_log.csv"
 )
 
-TIME_EXIT_ENABLED = env_bool("TIME_EXIT_ENABLED", True)
-
 TAKE_PROFIT_GT3_CENTS = float(os.getenv("TAKE_PROFIT_GT3_CENTS", "95"))
 TAKE_PROFIT_2_TO_3_CENTS = float(os.getenv("TAKE_PROFIT_2_TO_3_CENTS", "90"))
 TAKE_PROFIT_1_TO_2_CENTS = float(os.getenv("TAKE_PROFIT_1_TO_2_CENTS", "85"))
@@ -83,6 +81,8 @@ def env_bool(name, default=False):
     return os.getenv(name, "true" if default else "false").strip().lower() in {
         "1", "true", "yes", "on"
     }
+
+TIME_EXIT_ENABLED = env_bool("TIME_EXIT_ENABLED", True)
 
 EXIT_LOGGING_ENABLED = env_bool("EXIT_LOGGING_ENABLED", True)
 
