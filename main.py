@@ -16,18 +16,35 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 MODE = os.getenv("MODE", "paper").strip().lower()
-if MODE not in {"paper", "demo"}:
-    raise RuntimeError("MODE must be 'paper' or 'demo'.")
+if MODE not in {"paper", "demo", "live"}:
+    raise RuntimeError("MODE must be 'paper', 'demo', or 'live'.")
+
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+LIVE_TRADING_CONFIRM = os.getenv("LIVE_TRADING_CONFIRM", "").strip()
+LIVE_MAX_CONTRACTS = float(os.getenv("LIVE_MAX_CONTRACTS", "1"))
 
 if MODE == "paper":
+    # Production market data, simulated orders only.
     BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
     PLACE_ORDERS = False
-else:
+elif MODE == "demo":
     BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
-    PLACE_ORDERS = os.getenv("PLACE_DEMO_ORDERS", "false").lower() == "true"
+    PLACE_ORDERS = os.getenv("PLACE_DEMO_ORDERS", "false").strip().lower() == "true"
+else:
+    # Production market data + production authenticated orders.
+    BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+    if not LIVE_TRADING_ENABLED:
+        raise RuntimeError(
+            "LIVE safety lock: MODE=live requires LIVE_TRADING_ENABLED=true."
+        )
+    if LIVE_TRADING_CONFIRM != "YES_REAL_MONEY":
+        raise RuntimeError(
+            "LIVE safety lock: set LIVE_TRADING_CONFIRM=YES_REAL_MONEY to enable real orders."
+        )
+    PLACE_ORDERS = True
 
-if PLACE_ORDERS and "demo.kalshi.co" not in BASE_URL:
-    raise RuntimeError("Safety lock: orders are only allowed in Kalshi Demo.")
+if LIVE_MAX_CONTRACTS <= 0:
+    raise RuntimeError("LIVE_MAX_CONTRACTS must be > 0.")
 
 SERIES = os.getenv("SERIES", "KXBTC15M")
 STREAK_TRIGGER = int(os.getenv("STREAK_TRIGGER", "2"))
@@ -136,6 +153,7 @@ for slot in STRATEGY_SLOTS:
 
 # Multiple enabled slots may intentionally use the same streak length in paper mode
 # so different price/window hypotheses can be A/B tested on the same real market.
+# Demo/Live API mode intentionally places only the first matching slot per streak.
 
 if not 0 <= STOP_LOSS_CENTS <= 99:
     raise RuntimeError("STOP_LOSS_CENTS must be between 0 and 99; use 0 to disable.")
@@ -151,6 +169,19 @@ SESSION_LOG = os.path.join(DATA_DIR, "btc_session_results.csv")
 API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "").strip()
 PRIVATE_KEY_TEXT = os.getenv("KALSHI_PRIVATE_KEY", "")
 _private_key = None
+
+if MODE == "live":
+    if not API_KEY_ID or not PRIVATE_KEY_TEXT.strip():
+        raise RuntimeError(
+            "LIVE safety lock: production KALSHI_API_KEY_ID and "
+            "KALSHI_PRIVATE_KEY are required for MODE=live."
+        )
+    for slot in STRATEGY_SLOTS:
+        if slot["enabled"] and float(slot["contracts"]) > LIVE_MAX_CONTRACTS:
+            raise RuntimeError(
+                f"LIVE safety lock: SLOT {slot['name']} contracts={slot['contracts']:g} "
+                f"exceeds LIVE_MAX_CONTRACTS={LIVE_MAX_CONTRACTS:g}."
+            )
 
 TRADE_FIELDS = [
     "signal_time_utc",
@@ -216,7 +247,7 @@ def auth_headers(method, path):
 
 
 def authenticated_request(method, path, json_body=None):
-    """Authenticated Kalshi Demo request using the bot's existing auth_headers()."""
+    """Authenticated Kalshi request against the currently selected environment."""
     method = method.upper()
     headers = auth_headers(method, path)
     url = BASE_URL + path
@@ -1427,7 +1458,7 @@ def strategies_for_streak(streak):
 
 
 def strategy_for_streak(streak):
-    """Legacy single-slot selector used by Demo order placement."""
+    """Single-slot selector used by Demo/Live API order placement."""
     matches = strategies_for_streak(streak)
     return matches[0] if matches else None
 
@@ -1619,15 +1650,20 @@ def print_summary(rows=None):
 
 
 
-def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts, contracts):
+def place_resting_limit_order(ticker, side, limit_cents, expiration_ts, contracts):
     """
     Place one resting limit order that expires automatically at the end of
     the configured entry window.
     """
-    if MODE != "demo":
-        raise RuntimeError("Resting demo orders require MODE=demo")
+    if MODE not in {"demo", "live"}:
+        raise RuntimeError("Real API orders require MODE=demo or MODE=live")
     if not PLACE_ORDERS:
-        raise RuntimeError("PLACE_DEMO_ORDERS is false")
+        raise RuntimeError("Order placement is disabled")
+    if MODE == "live" and float(contracts) > LIVE_MAX_CONTRACTS:
+        raise RuntimeError(
+            f"LIVE safety lock: requested {float(contracts):g} contracts exceeds "
+            f"LIVE_MAX_CONTRACTS={LIVE_MAX_CONTRACTS:g}"
+        )
 
     client_order_id = str(uuid.uuid4())
 
@@ -1655,16 +1691,16 @@ def place_demo_resting_limit_order(ticker, side, limit_cents, expiration_ts, con
 
     resp = authenticated_request("POST", "/portfolio/events/orders", json_body=payload)
     order = resp.get("order", resp)
-    print(f"RESTING LIMIT ORDER: {order}")
+    print(f"{MODE.upper()} RESTING LIMIT ORDER ACCEPTED: {order}")
     return order
 
 
-def get_demo_order(order_id):
+def get_order(order_id):
     resp = authenticated_request("GET", f"/portfolio/orders/{order_id}")
     return resp.get("order", resp)
 
 
-def cancel_demo_order(order_id):
+def cancel_order(order_id):
     try:
         resp = authenticated_request("DELETE", f"/portfolio/events/orders/{order_id}")
         print(f"CANCEL RESULT: {resp}")
@@ -1702,7 +1738,7 @@ def order_remaining_count(order):
 
 def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, contracts):
     """
-    Submit a resting Demo order.
+    Submit a resting API order.
 
     Returns:
       ("accepted", order_dict)
@@ -1714,7 +1750,7 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
     """
     last_error = None
 
-    # Diagnostic check against the exact same Demo REST environment.
+    # Demo-only diagnostic preflight; production/live skips this.
     demo_market_preflight(ticker)
 
     for attempt in range(1, ORDER_SUBMIT_RETRIES + 1):
@@ -1731,7 +1767,7 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
                 f"SUBMIT ATTEMPT {attempt}/{ORDER_SUBMIT_RETRIES}: "
                 f"{ticker} {side.upper()} @ {limit_cents}c"
             )
-            order = place_demo_resting_limit_order(
+            order = place_resting_limit_order(
                 ticker, side, limit_cents, expiration_ts, contracts
             )
             print(
@@ -1744,9 +1780,9 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
             last_error = e
 
             if is_market_not_found_error(e):
+                env_name = "DEMO" if MODE == "demo" else "LIVE"
                 print(
-                    f"DEMO MARKET UNAVAILABLE: {ticker} was visible to market data "
-                    f"but the Demo matching engine returned market_not_found. "
+                    f"{env_name} MARKET UNAVAILABLE: {ticker} returned market_not_found. "
                     f"Skipping this ticker; no further retries."
                 )
                 return "market_not_found", None
@@ -2123,7 +2159,7 @@ def side_bid_cents(market, held_side):
     return dollars_to_cents(market.get(field))
 
 
-def submit_demo_exit_ioc(ticker, held_side, contracts, side_bid):
+def submit_exit_ioc(ticker, held_side, contracts, side_bid):
     """
     Exit an existing position using an immediate-or-cancel reduce-only order
     priced at the current executable bid for the held contract.
@@ -2132,10 +2168,15 @@ def submit_demo_exit_ioc(ticker, held_side, contracts, side_bid):
       - Sell YES -> ask YES at YES bid.
       - Sell NO  -> buy YES at 1 - NO bid.
     """
-    if MODE != "demo":
-        raise RuntimeError("Exit orders require MODE=demo")
+    if MODE not in {"demo", "live"}:
+        raise RuntimeError("API exit orders require MODE=demo or MODE=live")
     if not PLACE_ORDERS:
-        raise RuntimeError("PLACE_DEMO_ORDERS is false")
+        raise RuntimeError("Order placement is disabled")
+    if MODE == "live" and float(contracts) > LIVE_MAX_CONTRACTS:
+        raise RuntimeError(
+            f"LIVE safety lock: requested exit {float(contracts):g} contracts exceeds "
+            f"LIVE_MAX_CONTRACTS={LIVE_MAX_CONTRACTS:g}"
+        )
 
     if held_side == "yes":
         book_side = "ask"
@@ -2253,7 +2294,7 @@ def monitor_position_once(position):
             f"qty={exited:g} at observed bid={exit_cents:.1f}c — NO ORDER SENT"
         )
     else:
-        exit_order = submit_demo_exit_ioc(ticker, held_side, qty, bid)
+        exit_order = submit_exit_ioc(ticker, held_side, qty, bid)
         exited = order_fill_count(exit_order)
 
         if exited <= 0:
@@ -2295,8 +2336,17 @@ def main():
         print("*** REAL KALSHI MARKET DATA / PAPER TRADING ONLY / ZERO LIVE ORDERS ***")
         print("*** MULTI-SLOT A/B TESTING ENABLED: duplicate streak lengths allowed ***")
         print(f"PRODUCTION MARKET DATA API={BASE_URL}")
+    elif MODE == "demo":
+        print("*** KALSHI DEMO ENVIRONMENT / MOCK MONEY ***")
     else:
-        print("*** KALSHI DEMO ENVIRONMENT ***")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! LIVE KALSHI PRODUCTION TRADING — REAL MONEY ENABLED !!!")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print(f"PRODUCTION TRADE API={BASE_URL}")
+        print(
+            f"LIVE SAFETY: enabled={LIVE_TRADING_ENABLED} "
+            f"confirmation=OK max_contracts_per_order={LIVE_MAX_CONTRACTS:g}"
+        )
     print(
         f"MODE={MODE} SERIES={SERIES} "
         f"ORDER_POLL={POLL_ORDER_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s "
@@ -2585,7 +2635,7 @@ def main():
                     continue
 
                 order_id = current_order["order_id"]
-                order = get_demo_order(order_id)
+                order = get_order(order_id)
                 status = (order.get("status") or "").lower()
                 filled = order_fill_count(order)
                 remaining = order_remaining_count(order)
@@ -2653,7 +2703,7 @@ def main():
 
                 if utc_now().timestamp() >= current_order["expiration_ts"]:
                     print(f"ENTRY WINDOW ENDED: canceling {ticker}")
-                    cancel_demo_order(order_id)
+                    cancel_order(order_id)
                     current_order = None
                     sleep_idle()
                     continue
@@ -2711,7 +2761,7 @@ def main():
                 continue
 
             print(
-                f"PLACE LIMIT SLOT {slot_name}: {ticker} buy {side.upper()} "
+                f"{MODE.upper()} PLACE LIMIT SLOT {slot_name}: {ticker} buy {side.upper()} "
                 f"{contracts:g} @ {limit_cents}c age={age:.2f}m "
                 f"streak={streak}"
             )
@@ -2741,7 +2791,7 @@ def main():
                 continue
 
             if not PLACE_ORDERS:
-                print("DEMO limit signal only — PLACE_DEMO_ORDERS=false.")
+                print(f"{MODE.upper()} limit signal only — order placement disabled.")
                 log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
                 completed_markets.add(ticker)
                 sleep_idle()
@@ -2826,8 +2876,12 @@ def main():
             time.sleep(POLL_ORDER_SECONDS)
 
         except KeyboardInterrupt:
-            if current_order is not None and MODE == "demo" and current_order.get("order_id"):
-                cancel_demo_order(current_order["order_id"])
+            if (
+                current_order is not None
+                and MODE in {"demo", "live"}
+                and current_order.get("order_id")
+            ):
+                cancel_order(current_order["order_id"])
             break
 
         except requests.HTTPError as e:
