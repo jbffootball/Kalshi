@@ -234,6 +234,55 @@ def authenticated_request(method, path, json_body=None):
     return r.json() if r.text else {}
 
 
+
+def http_error_code(exc):
+    """Best-effort extraction of Kalshi's structured API error code."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err.get("code")
+    return None
+
+
+def is_market_not_found_error(exc):
+    return http_error_code(exc) == "market_not_found"
+
+
+def demo_market_preflight(ticker):
+    """
+    Confirm the exact ticker is still visible on the Demo market-data endpoint
+    immediately before attempting an order. This is diagnostic: Demo's public
+    market catalog and matching engine can still disagree, so a successful
+    preflight does not guarantee order acceptance.
+    """
+    if MODE != "demo":
+        return None
+    try:
+        data = get_json(f"/markets/{ticker}")
+        market = data.get("market", data)
+        print(
+            f"DEMO PREFLIGHT OK: {ticker} "
+            f"status={market.get('status','?')} "
+            f"close_time={market.get('close_time','?')}"
+        )
+        return market
+    except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", "?")
+        print(f"DEMO PREFLIGHT FAILED: {ticker} HTTP {status}")
+        return None
+    except Exception as e:
+        print(f"DEMO PREFLIGHT WARNING: {ticker} {e!r}")
+        return None
+
+
 def utc_now():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -1636,11 +1685,20 @@ def order_remaining_count(order):
 
 def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, contracts):
     """
-    Try to submit the resting limit order up to ORDER_SUBMIT_RETRIES times.
-    Stop immediately once Kalshi accepts an order. Never retry after the
-    configured entry window has expired.
+    Submit a resting Demo order.
+
+    Returns:
+      ("accepted", order_dict)
+      ("market_not_found", None)
+      ("failed", None)
+
+    MARKET_NOT_FOUND is terminal for that ticker. Retrying the same unknown
+    symbol seconds later only creates repeated 404s, so stop immediately.
     """
     last_error = None
+
+    # Diagnostic check against the exact same Demo REST environment.
+    demo_market_preflight(ticker)
 
     for attempt in range(1, ORDER_SUBMIT_RETRIES + 1):
         now_ts = utc_now().timestamp()
@@ -1663,7 +1721,23 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
                 f"SUBMIT ACCEPTED on attempt {attempt}: "
                 f"order_id={order.get('order_id')}"
             )
-            return order
+            return "accepted", order
+
+        except requests.HTTPError as e:
+            last_error = e
+
+            if is_market_not_found_error(e):
+                print(
+                    f"DEMO MARKET UNAVAILABLE: {ticker} was visible to market data "
+                    f"but the Demo matching engine returned market_not_found. "
+                    f"Skipping this ticker; no further retries."
+                )
+                return "market_not_found", None
+
+            print(
+                f"SUBMIT REJECTED attempt {attempt}/{ORDER_SUBMIT_RETRIES}: "
+                f"{e!r}"
+            )
 
         except Exception as e:
             last_error = e
@@ -1672,19 +1746,19 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
                 f"{e!r}"
             )
 
-            if attempt >= ORDER_SUBMIT_RETRIES:
-                break
+        if attempt >= ORDER_SUBMIT_RETRIES:
+            break
 
-            seconds_left = expiration_ts - utc_now().timestamp()
-            if seconds_left <= 0:
-                break
+        seconds_left = expiration_ts - utc_now().timestamp()
+        if seconds_left <= 0:
+            break
 
-            sleep_for = min(ORDER_RETRY_SECONDS, max(0.0, seconds_left))
-            if sleep_for <= 0:
-                break
+        sleep_for = min(ORDER_RETRY_SECONDS, max(0.0, seconds_left))
+        if sleep_for <= 0:
+            break
 
-            print(f"Retrying in {sleep_for:g}s...")
-            time.sleep(sleep_for)
+        print(f"Retrying in {sleep_for:g}s...")
+        time.sleep(sleep_for)
 
     print(
         f"SUBMIT FAILED: no resting order accepted for {ticker} "
@@ -1692,7 +1766,7 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
     )
     if last_error is not None:
         print(f"LAST SUBMIT ERROR: {last_error!r}")
-    return None
+    return "failed", None
 
 
 def get_market_by_ticker(ticker):
@@ -2231,6 +2305,7 @@ def main():
     print(f"PERFORMANCE LOG={PERFORMANCE_LOG}")
 
     completed_markets = logged_tickers()
+    demo_unavailable_markets = set()
     current_order = None
     current_position = None
     last_sequence_ticker = None
@@ -2379,6 +2454,14 @@ def main():
                 sleep_idle()
                 continue
 
+            if ticker in demo_unavailable_markets:
+                print(
+                    f"SKIP: {ticker} previously returned Demo market_not_found "
+                    f"during this process."
+                )
+                sleep_idle()
+                continue
+
             expiration_ts = market_entry_expiration_ts(market, entry_window)
 
             if utc_now().timestamp() >= expiration_ts:
@@ -2406,9 +2489,14 @@ def main():
                 sleep_idle()
                 continue
 
-            order = submit_resting_order_with_retry(
+            submit_status, order = submit_resting_order_with_retry(
                 ticker, side, limit_cents, expiration_ts, contracts
             )
+
+            if submit_status == "market_not_found":
+                demo_unavailable_markets.add(ticker)
+                sleep_active()
+                continue
 
             if order is None:
                 sleep_active()
