@@ -37,6 +37,8 @@ ENTRY_WINDOW_MINUTES = float(os.getenv("ENTRY_WINDOW_MINUTES", "3"))
 CONTRACTS = float(os.getenv("CONTRACTS", "1"))
 POLL_ACTIVE_SECONDS = float(os.getenv("POLL_ACTIVE_SECONDS", "2"))
 POLL_IDLE_SECONDS = float(os.getenv("POLL_IDLE_SECONDS", "60"))
+OUTAGE_BACKOFF_START_SECONDS = float(os.getenv("OUTAGE_BACKOFF_START_SECONDS", "10"))
+OUTAGE_BACKOFF_MAX_SECONDS = float(os.getenv("OUTAGE_BACKOFF_MAX_SECONDS", "60"))
 POLL_ORDER_SECONDS = float(os.getenv("POLL_ORDER_SECONDS", "10"))
 ORDER_SUBMIT_RETRIES = int(os.getenv("ORDER_SUBMIT_RETRIES", "3"))
 ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
@@ -254,6 +256,15 @@ def http_error_code(exc):
 
 def is_market_not_found_error(exc):
     return http_error_code(exc) == "market_not_found"
+
+
+def http_status_code(exc):
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def is_temporary_service_error(exc):
+    return http_status_code(exc) in {502, 503, 504}
 
 
 def demo_market_preflight(ticker):
@@ -2303,9 +2314,14 @@ def main():
     print(f"POSITION PRICE LOG={POSITION_PRICE_LOG}")
     print(f"POSITION SUMMARY LOG={POSITION_SUMMARY_LOG}")
     print(f"PERFORMANCE LOG={PERFORMANCE_LOG}")
+    print(
+        f"TEMP OUTAGE BACKOFF={OUTAGE_BACKOFF_START_SECONDS:g}s"
+        f"->{OUTAGE_BACKOFF_MAX_SECONDS:g}s for HTTP 502/503/504"
+    )
 
     completed_markets = logged_tickers()
     demo_unavailable_markets = set()
+    outage_backoff_seconds = OUTAGE_BACKOFF_START_SECONDS
     current_order = None
     current_position = None
     last_sequence_ticker = None
@@ -2316,6 +2332,9 @@ def main():
         try:
             # Build the immediate streak strictly from adjacent Kalshi strikes.
             immediate_markets = successive_strike_markets()
+            if outage_backoff_seconds != OUTAGE_BACKOFF_START_SECONDS:
+                print("KALSHI API RECOVERED: normal polling resumed.")
+            outage_backoff_seconds = OUTAGE_BACKOFF_START_SECONDS
             performance_settle_held_trades(immediate_markets)
 
             newest_ticker = (
@@ -2571,6 +2590,28 @@ def main():
             if current_order is not None:
                 cancel_demo_order(current_order["order_id"])
             break
+
+        except requests.HTTPError as e:
+            if is_temporary_service_error(e):
+                status = http_status_code(e)
+                wait_s = min(
+                    max(outage_backoff_seconds, OUTAGE_BACKOFF_START_SECONDS),
+                    OUTAGE_BACKOFF_MAX_SECONDS,
+                )
+                print(
+                    f"KALSHI TEMPORARILY UNAVAILABLE: HTTP {status}. "
+                    f"Backing off for {wait_s:g}s."
+                )
+                time.sleep(wait_s)
+                outage_backoff_seconds = min(
+                    wait_s * 2,
+                    OUTAGE_BACKOFF_MAX_SECONDS,
+                )
+                continue
+
+            print("ERROR:", repr(e))
+            time.sleep(min(10.0, POLL_IDLE_SECONDS))
+
         except Exception as e:
             print("ERROR:", repr(e))
             time.sleep(min(10.0, POLL_IDLE_SECONDS))
