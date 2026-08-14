@@ -134,9 +134,8 @@ for slot in STRATEGY_SLOTS:
     if slot["contracts"] <= 0:
         raise RuntimeError(f'STREAK_{slot["name"]}_CONTRACTS must be > 0')
 
-enabled_lengths = [s["streak"] for s in STRATEGY_SLOTS if s["enabled"]]
-if len(enabled_lengths) != len(set(enabled_lengths)):
-    raise RuntimeError("Enabled streak slots must use different streak lengths.")
+# Multiple enabled slots may intentionally use the same streak length in paper mode
+# so different price/window hypotheses can be A/B tested on the same real market.
 
 if not 0 <= STOP_LOSS_CENTS <= 99:
     raise RuntimeError("STOP_LOSS_CENTS must be between 0 and 99; use 0 to disable.")
@@ -1260,7 +1259,7 @@ def performance_start_trade(
     ticker, slot, trigger_streak, side, entry_cents, contracts
 ):
     rows = read_performance_log()
-    if any(r.get("ticker") == ticker for r in rows):
+    if any(r.get("ticker") == ticker and r.get("slot") == (slot or "") for r in rows):
         return
 
     rows.append({
@@ -1415,15 +1414,22 @@ def print_current_strategy_summary(rows=None):
         )
 
 
+def strategies_for_streak(streak):
+    """Return every enabled exact-match slot for this streak.
+
+    Paper mode may intentionally return multiple slots with the same streak so
+    they can be tested independently on the same production market.
+    """
+    return [
+        slot for slot in STRATEGY_SLOTS
+        if slot["enabled"] and streak == slot["streak"]
+    ]
+
+
 def strategy_for_streak(streak):
-    """
-    Exact-match strategy selection.
-    Example: if A=2, B=3, C=5, streak 4 produces no trade.
-    """
-    for slot in STRATEGY_SLOTS:
-        if slot["enabled"] and streak == slot["streak"]:
-            return slot
-    return None
+    """Legacy single-slot selector used by Demo order placement."""
+    matches = strategies_for_streak(streak)
+    return matches[0] if matches else None
 
 
 def opposite_side(result):
@@ -2287,6 +2293,7 @@ def main():
     print("KALSHI BTC 15-MINUTE STREAK BOT")
     if MODE == "paper":
         print("*** REAL KALSHI MARKET DATA / PAPER TRADING ONLY / ZERO LIVE ORDERS ***")
+        print("*** MULTI-SLOT A/B TESTING ENABLED: duplicate streak lengths allowed ***")
         print(f"PRODUCTION MARKET DATA API={BASE_URL}")
     else:
         print("*** KALSHI DEMO ENVIRONMENT ***")
@@ -2340,6 +2347,14 @@ def main():
     outage_backoff_seconds = OUTAGE_BACKOFF_START_SECONDS
     current_order = None
     current_position = None
+    # Real-market paper mode can carry several independent simulated resting
+    # orders at once, including multiple slots on the same ticker/streak.
+    paper_orders = {}  # key=(ticker, slot) -> simulated order
+    paper_completed = {
+        (r.get("ticker"), r.get("slot"))
+        for r in read_performance_log()
+        if r.get("ticker") and r.get("slot")
+    }
     last_sequence_ticker = None
 
     print_current_strategy_summary()
@@ -2362,6 +2377,112 @@ def main():
 
             last_result, streak = calculate_streak(immediate_markets)
             print(f"CALCULATED IMMEDIATE: last={last_result} streak={streak}")
+
+            # --------------------------------------------------------------
+            # REAL-MARKET PAPER MULTI-SLOT ENGINE
+            # --------------------------------------------------------------
+            if MODE == "paper":
+                # 1) Update every simulated resting order independently.
+                market_cache = {}
+                for key, po in list(paper_orders.items()):
+                    ticker_po, slot_po = key
+                    if utc_now().timestamp() >= po["expiration_ts"]:
+                        print(
+                            f"PAPER SLOT {slot_po} EXPIRED: {ticker_po} "
+                            f"{po['side'].upper()} limit={po['entry_cents']:.1f}c"
+                        )
+                        paper_orders.pop(key, None)
+                        continue
+
+                    try:
+                        live_market = market_cache.get(ticker_po)
+                        if live_market is None:
+                            live_market = get_market_by_ticker(ticker_po)
+                            market_cache[ticker_po] = live_market
+                        ask = entry_ask_cents(live_market, po["side"])
+                        age_now = market_age_minutes(live_market)
+                    except Exception as e:
+                        print(f"PAPER SLOT {slot_po} quote read failed for {ticker_po}: {e!r}")
+                        continue
+
+                    age_text = f"{age_now:.2f}m" if age_now is not None else "?"
+                    if ask is not None and ask <= po["entry_cents"]:
+                        fill_cents = float(po["entry_cents"])
+                        print(
+                            f"REAL MARKET PAPER FILL SLOT {slot_po}: {ticker_po} "
+                            f"{po['side'].upper()} qty={po['contracts']:g} "
+                            f"limit={fill_cents:.1f}c observed_ask={ask:.1f}c "
+                            f"age={age_text} — NO ORDER SENT"
+                        )
+                        log_signal(
+                            ticker_po, po["trigger_result"], po["trigger_streak"],
+                            po["side"], fill_cents,
+                            age_now if age_now is not None else po["age_at_submit"],
+                            po["contracts"],
+                        )
+                        performance_start_trade(
+                            ticker_po, slot_po, po["trigger_streak"], po["side"],
+                            fill_cents, po["contracts"],
+                        )
+                        paper_completed.add(key)
+                        paper_orders.pop(key, None)
+                    else:
+                        ask_text = f"{ask:.1f}c" if ask is not None else "NONE"
+                        print(
+                            f"PAPER SLOT {slot_po} RESTING: {ticker_po} "
+                            f"limit={po['entry_cents']:.1f}c ask={ask_text} age={age_text}"
+                        )
+
+                # 2) Create one independent simulated order for every matching slot.
+                if last_result in {"yes", "no"}:
+                    matches = strategies_for_streak(streak)
+                    if not matches:
+                        print(f"NO SLOT MATCH: streak={streak}; no paper orders.")
+                    else:
+                        open_markets = get_open_markets()
+                        for strategy in matches:
+                            slot_name = strategy["name"]
+                            entry_window = strategy["entry_window_minutes"]
+                            market = qualifying_current_market(open_markets, entry_window)
+                            if market is None:
+                                print(
+                                    f"PAPER SLOT {slot_name}: no qualifying market inside "
+                                    f"{entry_window:g}m window."
+                                )
+                                continue
+                            ticker = market["ticker"]
+                            key = (ticker, slot_name)
+                            if key in paper_completed or key in paper_orders:
+                                continue
+                            expiration_ts = market_entry_expiration_ts(market, entry_window)
+                            if utc_now().timestamp() >= expiration_ts:
+                                continue
+                            age = market_age_minutes(market)
+                            side = opposite_side(last_result)
+                            limit_cents = float(strategy["max_entry_cents"])
+                            contracts = float(strategy["contracts"])
+                            ask = entry_ask_cents(market, side)
+                            ask_text = f"{ask:.1f}c" if ask is not None else "NONE"
+                            paper_orders[key] = {
+                                "ticker": ticker, "slot": slot_name, "side": side,
+                                "entry_cents": limit_cents,
+                                "expiration_ts": expiration_ts,
+                                "trigger_result": last_result,
+                                "trigger_streak": streak,
+                                "age_at_submit": age,
+                                "contracts": contracts,
+                            }
+                            print(
+                                f"REAL MARKET PAPER LIMIT SLOT {slot_name}: {ticker} "
+                                f"buy {side.upper()} {contracts:g} @ {limit_cents:.0f}c "
+                                f"ask={ask_text} age={age:.2f}m window={entry_window:g}m "
+                                f"— NO ORDER SENT"
+                            )
+
+                # All paper fills are tracked independently and settled from the
+                # successive-strike result. Demo's single-order engine is skipped.
+                time.sleep(POLL_ORDER_SECONDS if paper_orders else POLL_ACTIVE_SECONDS)
+                continue
 
             # Manage a filled position before looking for any new entry.
             if current_position is not None:
