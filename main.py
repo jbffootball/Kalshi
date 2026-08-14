@@ -365,7 +365,7 @@ def get_json(path, params=None):
 
 
 PRICE_TEXT_RE = re.compile(
-    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:·-]?\s*\$?\s*"
+    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:Â·-]?\s*\$?\s*"
     r"([0-9][0-9,]*(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
@@ -1489,6 +1489,22 @@ def qualifying_current_market(open_markets, entry_window_minutes):
     return candidates[0][1]
 
 
+def current_15m_session_start(now=None):
+    """UTC start of the 15-minute session containing *now*."""
+    now = now or utc_now()
+    minute = (now.minute // 15) * 15
+    return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def market_for_session_start(open_markets, session_start):
+    """Return the KXBTC15M market whose true session start matches exactly."""
+    for m in open_markets:
+        start = btc_session_start(m)
+        if start is not None and start == session_start:
+            return m
+    return None
+
+
 def entry_ask_cents(market, outcome_side):
     field = "yes_ask_dollars" if outcome_side == "yes" else "no_ask_dollars"
     return dollars_to_cents(market.get(field))
@@ -2291,7 +2307,7 @@ def monitor_position_once(position):
         exit_cents = float(bid)
         print(
             f"REAL MARKET PAPER EXIT: {ticker} {held_side.upper()} "
-            f"qty={exited:g} at observed bid={exit_cents:.1f}c — NO ORDER SENT"
+            f"qty={exited:g} at observed bid={exit_cents:.1f}c â NO ORDER SENT"
         )
     else:
         exit_order = submit_exit_ioc(ticker, held_side, qty, bid)
@@ -2340,7 +2356,7 @@ def main():
         print("*** KALSHI DEMO ENVIRONMENT / MOCK MONEY ***")
     else:
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! LIVE KALSHI PRODUCTION TRADING — REAL MONEY ENABLED !!!")
+        print("!!! LIVE KALSHI PRODUCTION TRADING â REAL MONEY ENABLED !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print(f"PRODUCTION TRADE API={BASE_URL}")
         print(
@@ -2397,6 +2413,10 @@ def main():
     outage_backoff_seconds = OUTAGE_BACKOFF_START_SECONDS
     current_order = None
     current_position = None
+    # Demo/live signal latch. Once a qualifying streak is seen, keep that exact
+    # signal alive through its entry window even if the next successive strike
+    # arrives before Kalshi's current market becomes discoverable.
+    pending_api_signal = None
     # Real-market paper mode can carry several independent simulated resting
     # orders at once, including multiple slots on the same ticker/streak.
     paper_orders = {}  # key=(ticker, slot) -> simulated order
@@ -2462,7 +2482,7 @@ def main():
                             f"REAL MARKET PAPER FILL SLOT {slot_po}: {ticker_po} "
                             f"{po['side'].upper()} qty={po['contracts']:g} "
                             f"limit={fill_cents:.1f}c observed_ask={ask:.1f}c "
-                            f"age={age_text} — NO ORDER SENT"
+                            f"age={age_text} â NO ORDER SENT"
                         )
                         log_signal(
                             ticker_po, po["trigger_result"], po["trigger_streak"],
@@ -2526,7 +2546,7 @@ def main():
                                 f"REAL MARKET PAPER LIMIT SLOT {slot_name}: {ticker} "
                                 f"buy {side.upper()} {contracts:g} @ {limit_cents:.0f}c "
                                 f"ask={ask_text} age={age:.2f}m window={entry_window:g}m "
-                                f"— NO ORDER SENT"
+                                f"â NO ORDER SENT"
                             )
 
                 # All paper fills are tracked independently and settled from the
@@ -2580,7 +2600,7 @@ def main():
                         print(
                             f"REAL MARKET PAPER FILL: {ticker} {side.upper()} "
                             f"qty={filled:g} limit={fill_cents:.1f}c "
-                            f"observed_ask={observed_ask:.1f}c age={age_text} — NO ORDER SENT"
+                            f"observed_ask={observed_ask:.1f}c age={age_text} â NO ORDER SENT"
                         )
                         log_signal(
                             ticker,
@@ -2711,6 +2731,104 @@ def main():
                 time.sleep(POLL_ORDER_SECONDS)
                 continue
 
+            # --------------------------------------------------------------
+            # DEMO/LIVE SIGNAL LOCK
+            # --------------------------------------------------------------
+            # A streak signal can exist exactly at a 15-minute boundary before
+            # Kalshi's new market appears in the open-market listing. Latch the
+            # signal and retry that SAME target session until its window ends.
+            if pending_api_signal is not None:
+                now_ts = utc_now().timestamp()
+                if now_ts >= pending_api_signal["expiration_ts"]:
+                    print(
+                        f"SIGNAL LOCK EXPIRED SLOT {pending_api_signal['slot']}: "
+                        f"target_start={pending_api_signal['target_start'].isoformat()} "
+                        f"without finding/placing the target market."
+                    )
+                    pending_api_signal = None
+                else:
+                    open_markets = get_open_markets()
+                    market = market_for_session_start(
+                        open_markets, pending_api_signal["target_start"]
+                    )
+                    if market is None:
+                        remaining = pending_api_signal["expiration_ts"] - now_ts
+                        print(
+                            f"SIGNAL LOCK WAITING SLOT {pending_api_signal['slot']}: "
+                            f"streak={pending_api_signal['trigger_streak']} "
+                            f"target_start={pending_api_signal['target_start'].isoformat()} "
+                            f"market_not_visible_yet remaining={remaining:.1f}s"
+                        )
+                        time.sleep(POLL_ACTIVE_SECONDS)
+                        continue
+
+                    ticker = market["ticker"]
+                    age = market_age_minutes(market)
+                    side = pending_api_signal["side"]
+                    slot_name = pending_api_signal["slot"]
+                    limit_cents = pending_api_signal["entry_cents"]
+                    contracts = pending_api_signal["contracts"]
+                    expiration_ts = pending_api_signal["expiration_ts"]
+                    trigger_result = pending_api_signal["trigger_result"]
+                    trigger_streak = pending_api_signal["trigger_streak"]
+
+                    if ticker in completed_markets:
+                        print(
+                            f"SIGNAL LOCK CLEAR: {ticker} already completed by this bot."
+                        )
+                        pending_api_signal = None
+                        sleep_idle()
+                        continue
+
+                    print(
+                        f"SIGNAL LOCK FOUND SLOT {slot_name}: {ticker} buy {side.upper()} "
+                        f"{contracts:g} @ {limit_cents}c age={age:.2f}m "
+                        f"latched_streak={trigger_streak}"
+                    )
+
+                    status, order = submit_resting_order_with_retry(
+                        ticker, side, limit_cents, expiration_ts, contracts
+                    )
+                    if status == "market_not_found":
+                        # Do NOT throw away the latched signal. The listing and
+                        # matching engine can become consistent seconds later.
+                        remaining = expiration_ts - utc_now().timestamp()
+                        print(
+                            f"SIGNAL LOCK RETAINED SLOT {slot_name}: order endpoint "
+                            f"does not know {ticker} yet; remaining={remaining:.1f}s"
+                        )
+                        time.sleep(POLL_ACTIVE_SECONDS)
+                        continue
+                    if status != "accepted" or not order:
+                        remaining = expiration_ts - utc_now().timestamp()
+                        print(
+                            f"SIGNAL LOCK RETRY SLOT {slot_name}: submission not accepted; "
+                            f"remaining={remaining:.1f}s"
+                        )
+                        time.sleep(POLL_ACTIVE_SECONDS)
+                        continue
+
+                    order_id = order.get("order_id")
+                    current_order = {
+                        "order_id": order_id,
+                        "ticker": ticker,
+                        "side": side,
+                        "entry_cents": limit_cents,
+                        "expiration_ts": expiration_ts,
+                        "trigger_result": trigger_result,
+                        "trigger_streak": trigger_streak,
+                        "age_at_submit": age,
+                        "contracts": contracts,
+                        "slot": slot_name,
+                    }
+                    pending_api_signal = None
+                    print(
+                        f"ORDER RESTING SLOT {slot_name}: {ticker} {side.upper()} "
+                        f"@ {limit_cents}c expires={dt.datetime.fromtimestamp(expiration_ts, dt.timezone.utc).isoformat()}"
+                    )
+                    time.sleep(POLL_ORDER_SECONDS)
+                    continue
+
             # TIE/FLAG deliberately breaks the streak.
             if last_result not in {"yes", "no"}:
                 sleep_idle()
@@ -2727,162 +2845,44 @@ def main():
             limit_cents = strategy["max_entry_cents"]
             slot_name = strategy["name"]
 
-            market = qualifying_current_market(get_open_markets(), entry_window)
-            if market is None:
+            # Lock the trigger to the current 15-minute session BEFORE looking
+            # up the target market. This prevents a valid streak from vanishing
+            # if Kalshi's market listing is delayed across the boundary.
+            target_start = current_15m_session_start()
+            expiration_ts = (
+                target_start + dt.timedelta(minutes=entry_window)
+            ).timestamp()
+            side = opposite_side(last_result)
+
+            if utc_now().timestamp() >= expiration_ts:
                 print(
-                    f"SLOT {slot_name}: no qualifying market inside "
+                    f"SKIP: SLOT {slot_name} signal arrived after its "
                     f"{entry_window:g}m entry window."
                 )
                 sleep_idle()
                 continue
 
-            ticker = market["ticker"]
-            age = market_age_minutes(market)
-            side = opposite_side(last_result)
-
-            if ticker in completed_markets:
-                print(f"SKIP: {ticker} already completed by this bot.")
-                sleep_idle()
-                continue
-
-            if ticker in demo_unavailable_markets:
-                print(
-                    f"SKIP: {ticker} previously returned Demo market_not_found "
-                    f"during this process."
-                )
-                sleep_idle()
-                continue
-
-            expiration_ts = market_entry_expiration_ts(market, entry_window)
-
-            if utc_now().timestamp() >= expiration_ts:
-                print(f"SKIP: SLOT {slot_name} entry window expired for {ticker}.")
-                sleep_idle()
-                continue
-
-            print(
-                f"{MODE.upper()} PLACE LIMIT SLOT {slot_name}: {ticker} buy {side.upper()} "
-                f"{contracts:g} @ {limit_cents}c age={age:.2f}m "
-                f"streak={streak}"
-            )
-
-            if MODE == "paper":
-                observed_ask = entry_ask_cents(market, side)
-                ask_text = f"{observed_ask:.1f}c" if observed_ask is not None else "NONE"
-                print(
-                    f"REAL MARKET PAPER LIMIT CREATED: {ticker} buy {side.upper()} "
-                    f"{contracts:g} @ {limit_cents}c observed_ask={ask_text} "
-                    f"expires_at_entry_window — NO ORDER SENT"
-                )
-                current_order = {
-                    "order_id": None,
-                    "ticker": ticker,
-                    "side": side,
-                    "entry_cents": float(limit_cents),
-                    "expiration_ts": expiration_ts,
-                    "trigger_result": last_result,
-                    "trigger_streak": streak,
-                    "age_at_submit": age,
-                    "contracts": contracts,
-                    "slot": slot_name,
-                    "paper": True,
-                }
-                time.sleep(min(POLL_ORDER_SECONDS, 1.0))
-                continue
-
-            if not PLACE_ORDERS:
-                print(f"{MODE.upper()} limit signal only — order placement disabled.")
-                log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
-                completed_markets.add(ticker)
-                sleep_idle()
-                continue
-
-            submit_status, order = submit_resting_order_with_retry(
-                ticker, side, limit_cents, expiration_ts, contracts
-            )
-
-            if submit_status == "market_not_found":
-                demo_unavailable_markets.add(ticker)
-                sleep_active()
-                continue
-
-            if order is None:
-                sleep_active()
-                continue
-
-            order_id = order.get("order_id")
-            if not order_id:
-                raise RuntimeError(f"Accepted order response missing order_id: {order}")
-
-            filled = order_fill_count(order)
-            if filled > 0:
-                fill_cents = actual_fill_cents(order, side, limit_cents)
-                print(
-                    f"IMMEDIATE FILL: {ticker} {side.upper()} qty={filled:g} "
-                    f"at ~{fill_cents:.1f}c. MARKET LOCKED."
-                )
-                log_signal(ticker, last_result, streak, side, fill_cents, age, contracts)
-                performance_start_trade(
-                    ticker,
-                    slot_name,
-                    streak,
-                    side,
-                    fill_cents,
-                    filled,
-                )
-                completed_markets.add(ticker)
-                if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
-                    current_position = {
-                        "ticker": ticker,
-                        "side": side,
-                        "entry_cents": fill_cents,
-                        "contracts": filled,
-                    }
-                    start_exit_logging(
-                        ticker,
-                        slot_name,
-                        side,
-                        fill_cents,
-                        filled,
-                    )
-                    print(
-                        f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
-                        f"qty={filled:g} entry={fill_cents:.1f}c"
-                    )
-                    time.sleep(POLL_POSITION_SECONDS)
-                else:
-                    print("POSITION EXITS DISABLED; holding to market close.")
-                    sleep_idle()
-                continue
-
-            current_order = {
-                "order_id": order_id,
-                "ticker": ticker,
-                "side": side,
-                "entry_cents": limit_cents,
-                "expiration_ts": expiration_ts,
+            pending_api_signal = {
+                "slot": slot_name,
                 "trigger_result": last_result,
                 "trigger_streak": streak,
-                "age_at_submit": age,
-                "contracts": contracts,
-                "slot": slot_name,
+                "side": side,
+                "entry_cents": float(limit_cents),
+                "contracts": float(contracts),
+                "target_start": target_start,
+                "expiration_ts": expiration_ts,
             }
-
             print(
-                f"ORDER RESTING SLOT {slot_name}: {ticker} {side.upper()} "
-                f"{contracts:g} @ {limit_cents}c. "
-                f"Monitoring every {POLL_ORDER_SECONDS:g}s."
+                f"SIGNAL LOCKED SLOT {slot_name}: last={last_result} streak={streak} "
+                f"buy={side.upper()} limit={limit_cents}c "
+                f"target_start={target_start.isoformat()} "
+                f"expires={dt.datetime.fromtimestamp(expiration_ts, dt.timezone.utc).isoformat()}"
             )
-            time.sleep(POLL_ORDER_SECONDS)
+            # Re-enter the loop immediately; the SIGNAL LOCK handler above will
+            # find the exact target market and place the order when it appears.
+            time.sleep(min(POLL_ACTIVE_SECONDS, 0.5))
+            continue
 
-        except KeyboardInterrupt:
-            if (
-                current_order is not None
-                and MODE in {"demo", "live"}
-                and current_order.get("order_id")
-            ):
-                cancel_order(current_order["order_id"])
-            break
 
         except requests.HTTPError as e:
             if is_temporary_service_error(e):
