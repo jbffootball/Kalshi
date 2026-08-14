@@ -1505,6 +1505,23 @@ def market_for_session_start(open_markets, session_start):
     return None
 
 
+def latest_result_confirms_boundary(immediate_markets, target_start):
+    """
+    True only after the successive-strike dataset contains the result for the
+    session that JUST ended at target_start.
+
+    Example: for the 3:00-3:15 entry market, do not trade until the latest
+    derived result has close_time == 3:00. That proves the 3:00 Kalshi strike
+    is available and the 2:45-3:00 result has been incorporated.
+    """
+    if not immediate_markets:
+        return False
+    latest_close = parse_time(immediate_markets[-1].get("close_time"))
+    if latest_close is None:
+        return False
+    return latest_close == target_start
+
+
 def entry_ask_cents(market, outcome_side):
     field = "yes_ask_dollars" if outcome_side == "yes" else "no_ask_dollars"
     return dollars_to_cents(market.get(field))
@@ -2377,6 +2394,7 @@ def main():
             f"contracts={slot['contracts']:g}"
         )
     print("OUTCOME METHOD=successive Kalshi session strikes only")
+    print("BOUNDARY CONFIRMATION=ON; no entry until just-ended session is derived from new strike")
     print("SESSION CLOCK=close_time - 15 minutes")
     print("FUTURE STRIKE GUARD=enabled; future sessions excluded")
     print("OFFICIAL RESULT=not used")
@@ -2503,8 +2521,22 @@ def main():
                             f"limit={po['entry_cents']:.1f}c ask={ask_text} age={age_text}"
                         )
 
-                # 2) Create one independent simulated order for every matching slot.
-                if last_result in {"yes", "no"}:
+                # 2) Create new simulated orders only AFTER the new boundary strike
+                # has produced the just-ended session result.
+                paper_target_start = current_15m_session_start()
+                paper_boundary_ready = latest_result_confirms_boundary(
+                    immediate_markets, paper_target_start
+                )
+                if not paper_boundary_ready:
+                    latest_close = (
+                        immediate_markets[-1].get("close_time")
+                        if immediate_markets else "none"
+                    )
+                    print(
+                        f"BOUNDARY WAIT (PAPER): target_start={paper_target_start.isoformat()} "
+                        f"latest_derived_close={latest_close}; no new entry yet."
+                    )
+                elif last_result in {"yes", "no"}:
                     matches = strategies_for_streak(streak)
                     if not matches:
                         print(f"NO SLOT MATCH: streak={streak}; no paper orders.")
@@ -2513,11 +2545,24 @@ def main():
                         for strategy in matches:
                             slot_name = strategy["name"]
                             entry_window = strategy["entry_window_minutes"]
-                            market = qualifying_current_market(open_markets, entry_window)
+                            market = market_for_session_start(
+                                open_markets, paper_target_start
+                            )
                             if market is None:
                                 print(
-                                    f"PAPER SLOT {slot_name}: no qualifying market inside "
-                                    f"{entry_window:g}m window."
+                                    f"PAPER SLOT {slot_name}: target market for "
+                                    f"{paper_target_start.isoformat()} not visible yet."
+                                )
+                                continue
+                            age_check = market_age_minutes(market)
+                            if (
+                                age_check is None
+                                or age_check < 0
+                                or age_check > entry_window
+                            ):
+                                print(
+                                    f"PAPER SLOT {slot_name}: target market age "
+                                    f"{age_check} outside {entry_window:g}m window."
                                 )
                                 continue
                             ticker = market["ticker"]
@@ -2829,6 +2874,26 @@ def main():
                     time.sleep(POLL_ORDER_SECONDS)
                     continue
 
+            # --------------------------------------------------------------
+            # DEMO/LIVE BOUNDARY CONFIRMATION
+            # --------------------------------------------------------------
+            # Never use the previous streak at a new 15-minute boundary. Wait
+            # until the new Kalshi strike is present and therefore the session
+            # that just ended has been derived. Only then may we evaluate streak.
+            target_start = current_15m_session_start()
+            if not latest_result_confirms_boundary(immediate_markets, target_start):
+                latest_close = (
+                    immediate_markets[-1].get("close_time")
+                    if immediate_markets else "none"
+                )
+                print(
+                    f"BOUNDARY WAIT: target_start={target_start.isoformat()} "
+                    f"latest_derived_close={latest_close}; "
+                    f"refusing to lock/place an order from stale streak={streak}."
+                )
+                time.sleep(POLL_ACTIVE_SECONDS)
+                continue
+
             # TIE/FLAG deliberately breaks the streak.
             if last_result not in {"yes", "no"}:
                 sleep_idle()
@@ -2845,10 +2910,8 @@ def main():
             limit_cents = strategy["max_entry_cents"]
             slot_name = strategy["name"]
 
-            # Lock the trigger to the current 15-minute session BEFORE looking
-            # up the target market. This prevents a valid streak from vanishing
-            # if Kalshi's market listing is delayed across the boundary.
-            target_start = current_15m_session_start()
+            # The boundary above is confirmed. Lock this validated streak to
+            # that exact new 15-minute session and keep retrying market discovery.
             expiration_ts = (
                 target_start + dt.timedelta(minutes=entry_window)
             ).timestamp()
