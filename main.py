@@ -335,7 +335,7 @@ def get_json(path, params=None):
 
 
 PRICE_TEXT_RE = re.compile(
-    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:Â·-]?\s*\$?\s*"
+    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:·-]?\s*\$?\s*"
     r"([0-9][0-9,]*(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
@@ -2237,17 +2237,28 @@ def monitor_position_once(position):
         f"bid={bid:.1f}c qty={qty:g}"
     )
 
-    exit_order = submit_demo_exit_ioc(ticker, held_side, qty, bid)
-    exited = order_fill_count(exit_order)
-
-    if exited <= 0:
+    if MODE == "paper":
+        # Real-market paper mode: no API order is ever sent. Treat the currently
+        # displayed bid as the executable paper exit price.
+        exited = qty
+        exit_cents = float(bid)
         print(
-            f"{reason} EXIT NOT FILLED: {ticker}; "
-            f"will re-check on next position poll."
+            f"REAL MARKET PAPER EXIT: {ticker} {held_side.upper()} "
+            f"qty={exited:g} at observed bid={exit_cents:.1f}c — NO ORDER SENT"
         )
-        return "hold", position
+    else:
+        exit_order = submit_demo_exit_ioc(ticker, held_side, qty, bid)
+        exited = order_fill_count(exit_order)
 
-    exit_cents = actual_fill_cents(exit_order, held_side, bid)
+        if exited <= 0:
+            print(
+                f"{reason} EXIT NOT FILLED: {ticker}; "
+                f"will re-check on next position poll."
+            )
+            return "hold", position
+
+        exit_cents = actual_fill_cents(exit_order, held_side, bid)
+
     remaining = max(0.0, qty - exited)
     pnl_cents = (exit_cents - entry) * exited
 
@@ -2274,6 +2285,11 @@ def main():
     ensure_session_log()
 
     print("KALSHI BTC 15-MINUTE STREAK BOT")
+    if MODE == "paper":
+        print("*** REAL KALSHI MARKET DATA / PAPER TRADING ONLY / ZERO LIVE ORDERS ***")
+        print(f"PRODUCTION MARKET DATA API={BASE_URL}")
+    else:
+        print("*** KALSHI DEMO ENVIRONMENT ***")
     print(
         f"MODE={MODE} SERIES={SERIES} "
         f"ORDER_POLL={POLL_ORDER_SECONDS}s IDLE_POLL={POLL_IDLE_SECONDS}s "
@@ -2356,13 +2372,98 @@ def main():
                     time.sleep(POLL_POSITION_SECONDS)
                 continue
 
-            # Manage any already accepted resting order.
+            # Manage any already accepted/simulated resting order.
             if current_order is not None:
-                order_id = current_order["order_id"]
                 ticker = current_order["ticker"]
                 side = current_order["side"]
                 entry_cents = current_order["entry_cents"]
 
+                if MODE == "paper":
+                    if utc_now().timestamp() >= current_order["expiration_ts"]:
+                        print(
+                            f"REAL MARKET PAPER ORDER EXPIRED WITHOUT FILL: {ticker} "
+                            f"{side.upper()} limit={entry_cents:.1f}c"
+                        )
+                        current_order = None
+                        sleep_idle()
+                        continue
+
+                    live_market = get_market_by_ticker(ticker)
+                    observed_ask = entry_ask_cents(live_market, side)
+                    age_now = market_age_minutes(live_market)
+                    age_text = f"{age_now:.2f}m" if age_now is not None else "?"
+
+                    if observed_ask is None:
+                        print(
+                            f"REAL MARKET PAPER ORDER: {ticker} {side.upper()} "
+                            f"limit={entry_cents:.1f}c ask=NONE age={age_text}; waiting"
+                        )
+                        time.sleep(POLL_ORDER_SECONDS)
+                        continue
+
+                    if observed_ask <= entry_cents:
+                        # Conservative fill convention, matching the historical
+                        # backtest: credit the configured limit, not a better ask.
+                        fill_cents = float(entry_cents)
+                        filled = float(current_order["contracts"])
+                        print(
+                            f"REAL MARKET PAPER FILL: {ticker} {side.upper()} "
+                            f"qty={filled:g} limit={fill_cents:.1f}c "
+                            f"observed_ask={observed_ask:.1f}c age={age_text} — NO ORDER SENT"
+                        )
+                        log_signal(
+                            ticker,
+                            current_order["trigger_result"],
+                            current_order["trigger_streak"],
+                            side,
+                            fill_cents,
+                            age_now if age_now is not None else current_order["age_at_submit"],
+                            current_order["contracts"],
+                        )
+                        performance_start_trade(
+                            ticker,
+                            current_order.get("slot", ""),
+                            current_order["trigger_streak"],
+                            side,
+                            fill_cents,
+                            filled,
+                        )
+                        completed_markets.add(ticker)
+                        current_position = {
+                            "ticker": ticker,
+                            "side": side,
+                            "entry_cents": fill_cents,
+                            "contracts": filled,
+                        }
+                        start_exit_logging(
+                            ticker,
+                            current_order.get("slot", ""),
+                            side,
+                            fill_cents,
+                            filled,
+                        )
+                        current_order = None
+                        if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                            print(
+                                f"PAPER POSITION MONITOR STARTED: {ticker} {side.upper()} "
+                                f"qty={filled:g} entry={fill_cents:.1f}c"
+                            )
+                            time.sleep(POLL_POSITION_SECONDS)
+                        else:
+                            print("PAPER POSITION EXITS DISABLED; holding to market close.")
+                            current_position = None
+                            sleep_idle()
+                        continue
+
+                    print(
+                        f"REAL MARKET PAPER ORDER RESTING: {ticker} {side.upper()} "
+                        f"limit={entry_cents:.1f}c observed_ask={observed_ask:.1f}c "
+                        f"age={age_text}"
+                    )
+                    time.sleep(POLL_ORDER_SECONDS)
+                    continue
+
+                order_id = current_order["order_id"]
                 order = get_demo_order(order_id)
                 status = (order.get("status") or "").lower()
                 filled = order_fill_count(order)
@@ -2495,14 +2596,31 @@ def main():
             )
 
             if MODE == "paper":
-                print("PAPER LIMIT SIGNAL ONLY â no order sent.")
-                log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
-                completed_markets.add(ticker)
-                sleep_idle()
+                observed_ask = entry_ask_cents(market, side)
+                ask_text = f"{observed_ask:.1f}c" if observed_ask is not None else "NONE"
+                print(
+                    f"REAL MARKET PAPER LIMIT CREATED: {ticker} buy {side.upper()} "
+                    f"{contracts:g} @ {limit_cents}c observed_ask={ask_text} "
+                    f"expires_at_entry_window — NO ORDER SENT"
+                )
+                current_order = {
+                    "order_id": None,
+                    "ticker": ticker,
+                    "side": side,
+                    "entry_cents": float(limit_cents),
+                    "expiration_ts": expiration_ts,
+                    "trigger_result": last_result,
+                    "trigger_streak": streak,
+                    "age_at_submit": age,
+                    "contracts": contracts,
+                    "slot": slot_name,
+                    "paper": True,
+                }
+                time.sleep(min(POLL_ORDER_SECONDS, 1.0))
                 continue
 
             if not PLACE_ORDERS:
-                print("DEMO limit signal only â PLACE_DEMO_ORDERS=false.")
+                print("DEMO limit signal only — PLACE_DEMO_ORDERS=false.")
                 log_signal(ticker, last_result, streak, side, limit_cents, age, contracts)
                 completed_markets.add(ticker)
                 sleep_idle()
@@ -2587,7 +2705,7 @@ def main():
             time.sleep(POLL_ORDER_SECONDS)
 
         except KeyboardInterrupt:
-            if current_order is not None:
+            if current_order is not None and MODE == "demo" and current_order.get("order_id"):
                 cancel_demo_order(current_order["order_id"])
             break
 
