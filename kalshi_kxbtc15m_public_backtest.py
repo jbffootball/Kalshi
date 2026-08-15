@@ -34,7 +34,8 @@ Outputs
 -------
 /data/kalshi_validation_10000/
     sessions_with_streaks.csv
-    candles_1min.csv
+    candles_1min.csv                  # appended incrementally; survives restart
+    candle_progress.csv                 # one row per processed market
     grid_results.csv
     grid_ranked_by_avg_pnl.csv
     grid_ranked_min100_trades.csv
@@ -74,6 +75,11 @@ OUT_DIR = Path(os.getenv("OUT_DIR", "/data/kalshi_validation_10000"))
 if not OUT_DIR.parent.exists():
     OUT_DIR = Path("./kalshi_validation_10000")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Progress is written to the Railway volume after every market so an
+# interruption/redeploy can resume instead of restarting candle collection.
+CANDLE_FILE = OUT_DIR / "candles_1min.csv"
+PROGRESS_FILE = OUT_DIR / "candle_progress.csv"
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "kalshi-public-validation/1.0"})
@@ -310,6 +316,86 @@ def write_csv(path: Path, rows: List[dict]):
         w.writeheader()
         w.writerows(rows)
 
+def append_csv_rows(path: Path, rows: List[dict]):
+    """Append rows immediately, writing the header only for a new file."""
+    if not rows:
+        return
+    new_file = not path.exists() or path.stat().st_size == 0
+    fields = list(rows[0].keys())
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if new_file:
+            w.writeheader()
+        w.writerows(rows)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+
+def load_existing_candles() -> Tuple[Dict[str, List[dict]], List[dict]]:
+    """Load already checkpointed candle rows from a prior interrupted run."""
+    by_ticker = defaultdict(list)
+    rows = []
+    if not CANDLE_FILE.exists() or CANDLE_FILE.stat().st_size == 0:
+        return dict(by_ticker), rows
+
+    with CANDLE_FILE.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            # Restore numeric fields needed by the grid.
+            for key in (
+                "prior_streak", "actual_reversal", "minute", "candle_end_ts",
+                "yes_ask_low_cents", "yes_ask_close_cents",
+                "yes_bid_high_cents", "yes_bid_close_cents",
+                "reversal_ask_low_cents", "reversal_ask_close_cents",
+            ):
+                if row.get(key) not in (None, ""):
+                    try:
+                        row[key] = float(row[key])
+                    except ValueError:
+                        pass
+            if isinstance(row.get("prior_streak"), float):
+                row["prior_streak"] = int(row["prior_streak"])
+            if isinstance(row.get("actual_reversal"), float):
+                row["actual_reversal"] = int(row["actual_reversal"])
+            if isinstance(row.get("minute"), float):
+                row["minute"] = int(row["minute"])
+            if isinstance(row.get("candle_end_ts"), float):
+                row["candle_end_ts"] = int(row["candle_end_ts"])
+
+            ticker = row.get("ticker")
+            if ticker:
+                by_ticker[ticker].append(row)
+            rows.append(row)
+
+    return dict(by_ticker), rows
+
+
+def load_processed_tickers() -> set:
+    """Tickers in this file are complete, even if Kalshi returned zero candles."""
+    done = set()
+    if not PROGRESS_FILE.exists() or PROGRESS_FILE.stat().st_size == 0:
+        return done
+    with PROGRESS_FILE.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            ticker = row.get("ticker")
+            if ticker:
+                done.add(ticker)
+    return done
+
+
+def checkpoint_market(ticker: str, candle_count: int):
+    append_csv_rows(
+        PROGRESS_FILE,
+        [{
+            "ticker": ticker,
+            "candle_count": candle_count,
+            "processed_time_utc": iso(datetime.now(timezone.utc)),
+        }],
+    )
+
+
 def run_grid(
     sessions: List[dict],
     candles_by_ticker: Dict[str, List[dict]]
@@ -471,31 +557,86 @@ def main():
     print(f"Derived {len(sessions):,} tradable sessions")
     write_csv(OUT_DIR / "sessions_with_streaks.csv", sessions)
 
-    candles_by_ticker = {}
-    all_candle_rows = []
+    # RESUME SUPPORT ---------------------------------------------------------
+    # Load checkpointed data from the Railway volume first.
+    candles_by_ticker, all_candle_rows = load_existing_candles()
+    processed_tickers = load_processed_tickers()
+
+    # Backward-compatible recovery: if candles exist but the progress file was
+    # lost, treat candle-bearing tickers as processed.
+    processed_tickers.update(candles_by_ticker.keys())
+
     total = len(sessions)
+    already_done = sum(1 for s in sessions if s["ticker"] in processed_tickers)
+    if already_done:
+        print(
+            f"RESUME: found {already_done:,}/{total:,} already processed markets "
+            f"and {len(all_candle_rows):,} saved candle rows.",
+            flush=True,
+        )
+    else:
+        print("RESUME: no prior candle checkpoint found; starting candle collection.")
+
+    newly_processed = 0
 
     for idx, s in enumerate(sessions, 1):
+        ticker = s["ticker"]
+
+        if ticker in processed_tickers:
+            if idx % 100 == 0 or idx == total:
+                print(
+                    f"Candles: {idx:,}/{total:,} markets scanned; "
+                    f"{len(all_candle_rows):,} rows saved "
+                    f"(resume skipped {already_done:,})",
+                    flush=True,
+                )
+            continue
+
         cs = fetch_candles(
-            s["ticker"],
+            ticker,
             s["session_start_ts"],
             s["session_start_ts"] + 15 * 60
         )
         rows = [candle_row(s, c) for c in cs]
         rows = [r for r in rows if 1 <= r["minute"] <= 15]
-        candles_by_ticker[s["ticker"]] = rows
+
+        # Write the candle rows FIRST, then mark the ticker complete.
+        # If the container dies between these two writes, a few duplicate rows
+        # are possible on restart; they are deduplicated below before analysis.
+        if rows:
+            append_csv_rows(CANDLE_FILE, rows)
+
+        checkpoint_market(ticker, len(rows))
+        processed_tickers.add(ticker)
+        candles_by_ticker[ticker] = rows
         all_candle_rows.extend(rows)
+        newly_processed += 1
 
         if idx % 100 == 0 or idx == total:
             print(
-                f"Candles: {idx:,}/{total:,} markets; "
-                f"{len(all_candle_rows):,} rows",
+                f"Candles: {idx:,}/{total:,} markets scanned; "
+                f"{len(all_candle_rows):,} rows saved; "
+                f"new this run={newly_processed:,}",
                 flush=True
             )
 
         time.sleep(0.02)
 
-    write_csv(OUT_DIR / "candles_1min.csv", all_candle_rows)
+    # Deduplicate in memory in case a restart occurred between candle append
+    # and progress checkpoint for one market.
+    deduped = {}
+    for row in all_candle_rows:
+        key = (row.get("ticker"), row.get("candle_end_ts"))
+        deduped[key] = row
+    all_candle_rows = list(deduped.values())
+    all_candle_rows.sort(
+        key=lambda r: (r.get("ticker", ""), int(r.get("candle_end_ts") or 0))
+    )
+
+    candles_by_ticker = defaultdict(list)
+    for row in all_candle_rows:
+        candles_by_ticker[row["ticker"]].append(row)
+    candles_by_ticker = dict(candles_by_ticker)
 
     grid, trades = run_grid(sessions, candles_by_ticker)
     write_csv(OUT_DIR / "grid_results.csv", grid)
@@ -534,6 +675,7 @@ def main():
         "selected_strike_rows": len(markets),
         "derived_sessions": len(sessions),
         "candle_rows": len(all_candle_rows),
+        "candle_progress_markets": len(processed_tickers),
         "date_start": sessions[0]["session_start_utc"] if sessions else "",
         "date_end": sessions[-1]["close_time"] if sessions else "",
         "streak_range": [MIN_STREAK, MAX_STREAK],
@@ -550,34 +692,3 @@ def main():
             "Kalshi-only public data.",
             "This block skips the newest 5,000 markets to avoid overlap with discovery sample.",
             "Outcome uses successive Kalshi strikes, not official settlement.",
-            "Touch means 1-minute reversal ask low <= resting limit.",
-            "Fill assumed at configured limit.",
-            "Fees/slippage excluded.",
-            "1-minute candles cannot resolve exact 30-second timing.",
-            "Use price clusters and neighboring-cell stability rather than isolated penny maxima."
-        ]
-    }
-
-    (OUT_DIR / "run_summary.json").write_text(
-        json.dumps(summary, indent=2),
-        encoding="utf-8"
-    )
-
-    print("\nDONE")
-    print(f"1-minute candle rows: {len(all_candle_rows):,}")
-    print(f"Grid cells: {len(grid):,}")
-    print(f"Saved to: {OUT_DIR.resolve()}")
-
-    robust = [r for r in ranked if r["trades"] >= 250]
-    if robust:
-        print("\nTop 15 with >=250 trades:")
-        for r in robust[:15]:
-            print(
-                f"s{r['streak']} {r['entry_cents']}c/{r['window_minutes']}m "
-                f"n={r['trades']} win={r['win_rate_pct']}% "
-                f"avg={r['avg_pnl_per_trade_cents']}c "
-                f"total={r['total_pnl_cents']}c"
-            )
-
-if __name__ == "__main__":
-    main()
