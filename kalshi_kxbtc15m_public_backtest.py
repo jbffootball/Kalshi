@@ -1,109 +1,95 @@
 #!/usr/bin/env python3
 """
-Kalshi KXBTC15M 1-minute candle downloader + reversal grid backtester.
+Kalshi KXBTC15M universal-exit backtester.
 
-Uses ONLY Kalshi public market data.
-No external BTC feed. No Kalshi account credentials required.
+Purpose:
+- Reuse Kalshi-only public 1-minute candle data.
+- Test candidate entry streams with one UNIVERSAL stop-loss and one UNIVERSAL sell-early rule.
+- Hold-to-close remains the baseline.
+- Because candles are 1-minute, same-candle stop/target ordering is ambiguous. We report both:
+    * conservative: if both touched in same candle, STOP is assumed first
+    * optimistic:   if both touched in same candle, TARGET is assumed first
 
-Core outcome rule:
-    successive Kalshi strikes determine the just-ended 15-minute session:
-    next_strike > strike -> YES
-    next_strike < strike -> NO
-    equal -> TIE
+Default entry streams:
+    S2 <= 25c / 2 min
+    S3 <= 29c / 2 min
+    S5 <= 33c / 3 min
+These can be changed with environment variables.
 
-For a new market:
-    prior YES streak -> test buying NO
-    prior NO streak  -> test buying YES
+Outputs:
+    /data/kalshi_exit_backtest/exit_grid_results.csv
+    /data/kalshi_exit_backtest/exit_trade_details.csv
+    /data/kalshi_exit_backtest/run_summary.json
 
-Backtest fill assumption:
-    a resting limit order is considered touched when the 1-minute candle's
-    reversal-side ask LOW <= configured limit.
-    Fill price is conservatively recorded at the configured limit.
-    Trade is held to the successive-strike outcome.
+No trading. No private key. Public Kalshi data only.
 """
 
 import csv
 import json
 import math
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = os.getenv("SERIES_TICKER", "KXBTC15M")
-
 MAX_MARKETS = int(os.getenv("MAX_MARKETS", "5000"))
-MIN_STREAK = int(os.getenv("MIN_STREAK", "2"))
-MAX_STREAK = int(os.getenv("MAX_STREAK", "5"))
-MIN_ENTRY_CENTS = int(os.getenv("MIN_ENTRY_CENTS", "20"))
-MAX_ENTRY_CENTS = int(os.getenv("MAX_ENTRY_CENTS", "60"))
-MIN_WINDOW_MIN = int(os.getenv("MIN_WINDOW_MIN", "1"))
-MAX_WINDOW_MIN = int(os.getenv("MAX_WINDOW_MIN", "6"))
 
-# If true, save 1-minute candles for every selected market (~15 rows/market).
-# For 5,000 markets this is roughly 75,000 rows when Kalshi has all minutes.
-FETCH_CANDLES_ALL_MARKETS = os.getenv("FETCH_CANDLES_ALL_MARKETS", "true").lower() in ("1","true","yes","y")
+# Three entry streams, configurable.
+STREAMS = [
+    {"name": "A", "streak": int(os.getenv("A_STREAK", "2")), "entry": int(os.getenv("A_ENTRY_CENTS", "25")), "window": int(os.getenv("A_WINDOW_MIN", "2"))},
+    {"name": "B", "streak": int(os.getenv("B_STREAK", "3")), "entry": int(os.getenv("B_ENTRY_CENTS", "29")), "window": int(os.getenv("B_WINDOW_MIN", "2"))},
+    {"name": "C", "streak": int(os.getenv("C_STREAK", "5")), "entry": int(os.getenv("C_ENTRY_CENTS", "33")), "window": int(os.getenv("C_WINDOW_MIN", "3"))},
+]
 
-OUT_DIR = Path(os.getenv("OUT_DIR", "/data/kalshi_reversal_backtest"))
+# Universal exits. 0 means OFF for stop, 100 means OFF for target.
+STOP_LEVELS = [0, 5, 10, 15, 20]
+TARGET_LEVELS = [100, 70, 75, 80, 85, 90]
+
+OUT_DIR = Path(os.getenv("OUT_DIR", "/data/kalshi_exit_backtest"))
 if not OUT_DIR.parent.exists():
-    OUT_DIR = Path("./kalshi_reversal_backtest")
+    OUT_DIR = Path("./kalshi_exit_backtest")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "kalshi-public-research/1.0"})
+SESSION.headers.update({"User-Agent": "kalshi-public-research-exit/1.0"})
 
-def iso(dt: datetime) -> str:
+def iso(dt):
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+def parse_time(s):
+    return datetime.fromisoformat(str(s).replace("Z","+00:00")).astimezone(timezone.utc)
 
-def get_json(path: str, params: Optional[dict] = None, tries: int = 8) -> dict:
+def get_json(path, params=None, tries=8):
     url = BASE + path
     delay = 1.0
     last = None
-    for attempt in range(tries):
+    for _ in range(tries):
         try:
             r = SESSION.get(url, params=params, timeout=30)
             if r.status_code == 200:
                 return r.json()
-            last = f"{r.status_code}: {r.text[:300]}"
-            if r.status_code in (429, 500, 502, 503, 504):
+            last = f"{r.status_code}: {r.text[:250]}"
+            if r.status_code in (429,500,502,503,504):
                 time.sleep(delay)
-                delay = min(delay * 2, 30)
+                delay = min(delay*2, 30)
                 continue
-            raise RuntimeError(f"GET {url} failed: {last}")
+            raise RuntimeError(last)
         except requests.RequestException as e:
             last = repr(e)
             time.sleep(delay)
-            delay = min(delay * 2, 30)
-    raise RuntimeError(f"GET {url} failed after retries: {last}")
+            delay = min(delay*2, 30)
+    raise RuntimeError(f"{url}: {last}")
 
-def get_cutoff() -> Optional[int]:
-    try:
-        d = get_json("/historical/cutoff")
-        # Docs use market_settled_ts. Be defensive about nesting/type.
-        v = d.get("market_settled_ts")
-        if v is None and isinstance(d.get("cutoff"), dict):
-            v = d["cutoff"].get("market_settled_ts")
-        if isinstance(v, str):
-            if v.isdigit():
-                return int(v)
-            return int(parse_time(v).timestamp())
-        return int(v) if v is not None else None
-    except Exception:
-        return None
-
-def fetch_market_pages(path: str, series: str) -> List[dict]:
+def fetch_pages(path):
     out = []
     cursor = None
     while True:
-        params = {"limit": 1000, "series_ticker": series}
+        params = {"limit":1000, "series_ticker":SERIES}
         if cursor:
             params["cursor"] = cursor
         d = get_json(path, params)
@@ -115,367 +101,303 @@ def fetch_market_pages(path: str, series: str) -> List[dict]:
             break
     return out
 
-def fetch_all_series_markets() -> List[dict]:
-    # Historical endpoint contains archived markets; live endpoint contains current/recent.
-    hist = fetch_market_pages("/historical/markets", SERIES)
-    live = fetch_market_pages("/markets", SERIES)
-
-    by_ticker = {}
-    for m in hist + live:
-        t = m.get("ticker")
-        if t:
-            by_ticker[t] = m
-
-    rows = list(by_ticker.values())
-    rows = [m for m in rows if m.get("close_time") and m.get("floor_strike") is not None]
-    rows.sort(key=lambda m: parse_time(m["close_time"]))
-
-    # Need one extra strike after the newest traded session to derive that session's result.
+def fetch_markets():
+    by = {}
+    for m in fetch_pages("/historical/markets") + fetch_pages("/markets"):
+        if m.get("ticker"):
+            by[m["ticker"]] = m
+    rows = [m for m in by.values() if m.get("close_time") and m.get("floor_strike") is not None]
+    rows.sort(key=lambda x: parse_time(x["close_time"]))
     if len(rows) > MAX_MARKETS + 1:
-        rows = rows[-(MAX_MARKETS + 1):]
+        rows = rows[-(MAX_MARKETS+1):]
     return rows
 
-def derive_sessions(markets: List[dict]) -> List[dict]:
-    """
-    Each market's strike is the start/reference price for that 15-minute session.
-    Outcome for market i is determined by strike[i+1] vs strike[i].
-    """
-    sessions = []
-    running_side = None
-    running_len = 0
-
-    for i in range(len(markets) - 1):
-        m = markets[i]
-        nxt = markets[i + 1]
-        strike = float(m["floor_strike"])
-        next_strike = float(nxt["floor_strike"])
-
-        if next_strike > strike:
-            result = "YES"
-        elif next_strike < strike:
-            result = "NO"
-        else:
-            result = "TIE"
-
+def derive_sessions(markets):
+    base = []
+    run_side = None
+    run_len = 0
+    for i in range(len(markets)-1):
+        m, nxt = markets[i], markets[i+1]
+        a, b = float(m["floor_strike"]), float(nxt["floor_strike"])
+        result = "YES" if b>a else ("NO" if b<a else "TIE")
         if result == "TIE":
-            running_side = None
-            running_len = 0
-        elif result == running_side:
-            running_len += 1
+            run_side, run_len = None, 0
+        elif result == run_side:
+            run_len += 1
         else:
-            running_side = result
-            running_len = 1
-
+            run_side, run_len = result, 1
         close_dt = parse_time(m["close_time"])
-        start_dt = close_dt.timestamp() - 15 * 60
-
-        sessions.append({
-            "ticker": m["ticker"],
-            "close_time": m["close_time"],
-            "session_start_ts": int(start_dt),
-            "session_start_utc": iso(datetime.fromtimestamp(start_dt, tz=timezone.utc)),
-            "strike": strike,
-            "next_strike": next_strike,
-            "result": result,
-            "streak_ending_here": running_len,
-            "streak_side_ending_here": running_side or "",
-            "settlement_ts": m.get("settlement_ts") or "",
+        start_ts = int(close_dt.timestamp()) - 15*60
+        base.append({
+            "ticker":m["ticker"],
+            "close_time":m["close_time"],
+            "session_start_ts":start_ts,
+            "session_start_utc":iso(datetime.fromtimestamp(start_ts,tz=timezone.utc)),
+            "result":result,
+            "streak_here":run_len,
         })
-
-    # Attach PRIOR result/streak to each market to be traded.
-    by_ticker = {s["ticker"]: s for s in sessions}
-    enriched = []
-    for i in range(1, len(markets) - 1):
-        cur = markets[i]
-        prev_s = by_ticker.get(markets[i-1]["ticker"])
-        cur_s = by_ticker.get(cur["ticker"])
-        if not prev_s or not cur_s:
+    by = {x["ticker"]:x for x in base}
+    out = []
+    for i in range(1, len(markets)-1):
+        cur = by.get(markets[i]["ticker"])
+        prev = by.get(markets[i-1]["ticker"])
+        if not cur or not prev or prev["result"] not in ("YES","NO"):
             continue
-        enriched.append({
-            **cur_s,
-            "prior_result": prev_s["result"],
-            "prior_streak": prev_s["streak_ending_here"],
-            "prior_streak_side": prev_s["streak_side_ending_here"],
-            "reversal_side": "NO" if prev_s["result"] == "YES" else ("YES" if prev_s["result"] == "NO" else ""),
-            "actual_reversal": int(
-                prev_s["result"] in ("YES","NO")
-                and cur_s["result"] in ("YES","NO")
-                and prev_s["result"] != cur_s["result"]
-            ),
+        out.append({
+            **cur,
+            "prior_result":prev["result"],
+            "prior_streak":prev["streak_here"],
+            "reversal_side":"NO" if prev["result"]=="YES" else "YES",
+            "actual_reversal": int(cur["result"] in ("YES","NO") and cur["result"] != prev["result"]),
         })
-    return enriched
+    return out
 
-def val(d: Optional[dict], key: str) -> Optional[float]:
+def v(d, key):
     if not isinstance(d, dict):
         return None
-    # Current endpoint uses *_dollars; historical may use plain keys.
-    for k in (key + "_dollars", key):
-        x = d.get(k)
-        if x is not None:
+    for k in (key+"_dollars", key):
+        if d.get(k) is not None:
             try:
-                return float(x)
-            except (TypeError, ValueError):
+                return float(d[k])
+            except:
                 return None
     return None
 
-def fetch_candles(ticker: str, start_ts: int, end_ts: int, prefer_historical: bool) -> List[dict]:
-    params = {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 1}
-    paths = (
-        [f"/historical/markets/{ticker}/candlesticks",
-         f"/series/{SERIES}/markets/{ticker}/candlesticks"]
-        if prefer_historical else
-        [f"/series/{SERIES}/markets/{ticker}/candlesticks",
-         f"/historical/markets/{ticker}/candlesticks"]
-    )
-    last_err = None
-    for path in paths:
+def fetch_candles(ticker, start_ts, end_ts):
+    params = {"start_ts":start_ts, "end_ts":end_ts, "period_interval":1}
+    paths = [
+        f"/series/{SERIES}/markets/{ticker}/candlesticks",
+        f"/historical/markets/{ticker}/candlesticks",
+    ]
+    for p in paths:
         try:
-            d = get_json(path, params, tries=4)
+            d = get_json(p, params, tries=4)
             cs = d.get("candlesticks", [])
             if cs:
                 return cs
-        except Exception as e:
-            last_err = e
-    if last_err:
-        print(f"WARNING candles unavailable {ticker}: {last_err}", flush=True)
+        except Exception:
+            pass
     return []
 
-def candle_row(session: dict, c: dict) -> dict:
-    end_ts = int(c.get("end_period_ts"))
-    elapsed_sec = end_ts - session["session_start_ts"]
-    minute = int(math.ceil(elapsed_sec / 60.0))
-
+def convert_candle(s, c):
+    end_ts = int(c["end_period_ts"])
+    minute = int(math.ceil((end_ts - s["session_start_ts"])/60.0))
     yb = c.get("yes_bid") or {}
     ya = c.get("yes_ask") or {}
+    yb_low, yb_high, yb_close = v(yb,"low"), v(yb,"high"), v(yb,"close")
+    ya_low, ya_high, ya_close = v(ya,"low"), v(ya,"high"), v(ya,"close")
 
-    yes_ask_low = val(ya, "low")
-    yes_ask_close = val(ya, "close")
-    yes_bid_high = val(yb, "high")
-    yes_bid_close = val(yb, "close")
-
-    if session["reversal_side"] == "YES":
-        rev_ask_low = yes_ask_low
-        rev_ask_close = yes_ask_close
-        rev_bid_high = yes_bid_high
-        rev_bid_close = yes_bid_close
+    if s["reversal_side"] == "YES":
+        ask_low = ya_low
+        bid_low = yb_low
+        bid_high = yb_high
+        bid_close = yb_close
     else:
-        # NO ask = 1 - YES bid; for the LOWEST NO ask in a candle,
-        # use the HIGHEST YES bid in that candle.
-        rev_ask_low = None if yes_bid_high is None else 1.0 - yes_bid_high
-        rev_ask_close = None if yes_bid_close is None else 1.0 - yes_bid_close
-        # NO bid = 1 - YES ask; highest NO bid uses lowest YES ask.
-        rev_bid_high = None if yes_ask_low is None else 1.0 - yes_ask_low
-        rev_bid_close = None if yes_ask_close is None else 1.0 - yes_ask_close
+        # NO ask = 1 - YES bid
+        ask_low = None if yb_high is None else 1-yb_high
+        # NO bid = 1 - YES ask
+        # lowest NO bid occurs when YES ask is highest
+        bid_low = None if ya_high is None else 1-ya_high
+        # highest NO bid occurs when YES ask is lowest
+        bid_high = None if ya_low is None else 1-ya_low
+        bid_close = None if ya_close is None else 1-ya_close
 
-    def cents(x):
-        return None if x is None else round(x * 100.0, 4)
-
+    cents = lambda x: None if x is None else round(x*100.0,4)
     return {
-        "ticker": session["ticker"],
-        "close_time": session["close_time"],
-        "session_start_utc": session["session_start_utc"],
-        "result": session["result"],
-        "prior_result": session["prior_result"],
-        "prior_streak": session["prior_streak"],
-        "reversal_side": session["reversal_side"],
-        "actual_reversal": session["actual_reversal"],
-        "minute": minute,
-        "candle_end_ts": end_ts,
-        "yes_ask_low_cents": cents(yes_ask_low),
-        "yes_ask_close_cents": cents(yes_ask_close),
-        "yes_bid_high_cents": cents(yes_bid_high),
-        "yes_bid_close_cents": cents(yes_bid_close),
-        "reversal_ask_low_cents": cents(rev_ask_low),
-        "reversal_ask_close_cents": cents(rev_ask_close),
-        "reversal_bid_high_cents": cents(rev_bid_high),
-        "reversal_bid_close_cents": cents(rev_bid_close),
-        "volume": c.get("volume_fp", c.get("volume")),
-        "open_interest": c.get("open_interest_fp", c.get("open_interest")),
+        "minute":minute,
+        "end_ts":end_ts,
+        "ask_low":cents(ask_low),
+        "bid_low":cents(bid_low),
+        "bid_high":cents(bid_high),
+        "bid_close":cents(bid_close),
     }
 
-def write_csv(path: Path, rows: List[dict]):
+def write_csv(path, rows):
     if not rows:
-        print(f"No rows for {path.name}")
         return
     fields = list(rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
 
-def run_grid(sessions: List[dict], candles_by_ticker: Dict[str, List[dict]]) -> Tuple[List[dict], List[dict]]:
-    grid = []
-    trades = []
+def choose_stream(streak):
+    # one stream per exact streak
+    for s in STREAMS:
+        if s["streak"] == streak:
+            return s
+    return None
 
-    eligible = [s for s in sessions if MIN_STREAK <= s["prior_streak"] <= MAX_STREAK and s["reversal_side"]]
-    print(f"Eligible streak {MIN_STREAK}-{MAX_STREAK} markets: {len(eligible):,}", flush=True)
+def simulate_trade(session, rows, stream, stop_level, target_level, same_candle_policy):
+    entry = stream["entry"]
+    window = stream["window"]
 
-    # Pre-sort rows and keep only the 15-minute session.
-    usable = {}
-    for s in eligible:
-        rows = [
-            r for r in candles_by_ticker.get(s["ticker"], [])
-            if 1 <= r["minute"] <= 15 and r["reversal_ask_low_cents"] is not None
-        ]
-        rows.sort(key=lambda r: (r["minute"], r["candle_end_ts"]))
-        usable[s["ticker"]] = rows
+    touch_idx = None
+    for i,r in enumerate(rows):
+        if r["minute"] > window:
+            break
+        if r["ask_low"] is not None and r["ask_low"] <= entry:
+            touch_idx = i
+            break
+    if touch_idx is None:
+        return None
 
-    for streak in range(MIN_STREAK, MAX_STREAK + 1):
-        ss = [s for s in eligible if s["prior_streak"] == streak]
-        for entry in range(MIN_ENTRY_CENTS, MAX_ENTRY_CENTS + 1):
-            for window in range(MIN_WINDOW_MIN, MAX_WINDOW_MIN + 1):
-                n = wins = losses = 0
-                pnl = 0.0
-                for s in ss:
-                    touch = None
-                    for r in usable.get(s["ticker"], []):
-                        if r["minute"] > window:
-                            break
-                        if r["reversal_ask_low_cents"] <= entry:
-                            touch = r
-                            break
-                    if touch is None:
-                        continue
+    # Conservative fill at configured limit.
+    entry_price = entry
 
-                    n += 1
-                    win = bool(s["actual_reversal"])
-                    if win:
-                        wins += 1
-                        trade_pnl = 100 - entry
-                    else:
-                        losses += 1
-                        trade_pnl = -entry
-                    pnl += trade_pnl
-                    trades.append({
-                        "streak": streak,
-                        "entry_cents": entry,
-                        "window_minutes": window,
-                        "ticker": s["ticker"],
-                        "prior_result": s["prior_result"],
-                        "reversal_side": s["reversal_side"],
-                        "entry_touch_minute": touch["minute"],
-                        "actual_reversal": int(win),
-                        "pnl_cents": trade_pnl,
-                    })
+    # Exit checks begin with the entry candle itself because after a fill sometime
+    # within that 1-minute candle, the exit level may also have been touched.
+    # Exact within-candle ordering is unknowable from 1-minute OHLC.
+    for r in rows[touch_idx:]:
+        hit_stop = bool(stop_level and r["bid_low"] is not None and r["bid_low"] <= stop_level)
+        hit_target = bool(target_level < 100 and r["bid_high"] is not None and r["bid_high"] >= target_level)
 
-                grid.append({
-                    "streak": streak,
-                    "entry_cents": entry,
-                    "window_minutes": window,
-                    "trades": n,
-                    "wins": wins,
-                    "losses": losses,
-                    "win_rate_pct": round(100.0 * wins / n, 3) if n else "",
-                    "break_even_win_rate_pct": entry,
-                    "edge_vs_break_even_pct_points": round((100.0 * wins / n) - entry, 3) if n else "",
-                    "total_pnl_cents": round(pnl, 2),
-                    "avg_pnl_per_trade_cents": round(pnl / n, 3) if n else "",
-                })
+        if hit_stop and hit_target:
+            if same_candle_policy == "stop_first":
+                exit_price, reason = stop_level, "STOP"
+            else:
+                exit_price, reason = target_level, "TARGET"
+            return entry_price, exit_price, reason, r["minute"]
 
-    return grid, trades
+        if hit_stop:
+            return entry_price, stop_level, "STOP", r["minute"]
+        if hit_target:
+            return entry_price, target_level, "TARGET", r["minute"]
+
+    # Held to close. Settlement proxy from successive strikes.
+    exit_price = 100 if session["actual_reversal"] else 0
+    return entry_price, exit_price, "CLOSE", 15
 
 def main():
-    print("KALSHI KXBTC15M PUBLIC-DATA BACKTEST")
-    print(f"series={SERIES} max_markets={MAX_MARKETS:,}")
-    print(f"streaks={MIN_STREAK}-{MAX_STREAK} entries={MIN_ENTRY_CENTS}-{MAX_ENTRY_CENTS}c windows={MIN_WINDOW_MIN}-{MAX_WINDOW_MIN}m")
-    print(f"output={OUT_DIR.resolve()}")
+    print("KALSHI UNIVERSAL EXIT BACKTEST")
+    print("Streams:")
+    for s in STREAMS:
+        print(f"  {s['name']}: S{s['streak']} <= {s['entry']}c / {s['window']}m")
+    print("Stops:", STOP_LEVELS)
+    print("Targets:", TARGET_LEVELS)
     print()
 
-    cutoff = get_cutoff()
-    print(f"historical market cutoff ts={cutoff}", flush=True)
-
-    markets = fetch_all_series_markets()
-    if len(markets) < 10:
-        raise RuntimeError(f"Only found {len(markets)} {SERIES} markets; aborting.")
-
-    print(f"Selected {len(markets):,} strike rows spanning {markets[0]['close_time']} -> {markets[-1]['close_time']}")
+    markets = fetch_markets()
     sessions = derive_sessions(markets)
-    print(f"Derived {len(sessions):,} tradable sessions")
+    relevant = [s for s in sessions if choose_stream(s["prior_streak"]) is not None]
+    print(f"Relevant sessions: {len(relevant):,}")
 
-    write_csv(OUT_DIR / "sessions_with_streaks.csv", sessions)
-
-    # Fetch candles. Default is all selected sessions so we preserve the ~75k-row research table.
-    targets = sessions if FETCH_CANDLES_ALL_MARKETS else [
-        s for s in sessions if MIN_STREAK <= s["prior_streak"] <= MAX_STREAK
-    ]
-
-    candles_by_ticker = {}
-    all_candle_rows = []
-    total = len(targets)
-
-    for idx, s in enumerate(targets, 1):
-        # One extra minute on each side is harmless; we filter exact minute 1..15 later.
-        start_ts = s["session_start_ts"]
-        end_ts = start_ts + 15 * 60
-        settlement_ts = s.get("settlement_ts")
-        prefer_hist = False
-        if cutoff and settlement_ts:
-            try:
-                st = parse_time(settlement_ts).timestamp() if not str(settlement_ts).isdigit() else int(settlement_ts)
-                prefer_hist = st < cutoff
-            except Exception:
-                pass
-
-        cs = fetch_candles(s["ticker"], start_ts, end_ts, prefer_hist)
-        rows = [candle_row(s, c) for c in cs]
+    candle_map = {}
+    raw_count = 0
+    for i,s in enumerate(relevant,1):
+        cs = fetch_candles(s["ticker"], s["session_start_ts"], s["session_start_ts"]+15*60)
+        rows = [convert_candle(s,c) for c in cs]
         rows = [r for r in rows if 1 <= r["minute"] <= 15]
-        candles_by_ticker[s["ticker"]] = rows
-        all_candle_rows.extend(rows)
-
-        if idx % 100 == 0 or idx == total:
-            print(f"Candles: {idx:,}/{total:,} markets; {len(all_candle_rows):,} rows", flush=True)
-
-        # Small courtesy delay; 429 handling above adds exponential backoff if needed.
+        rows.sort(key=lambda r:(r["minute"],r["end_ts"]))
+        candle_map[s["ticker"]] = rows
+        raw_count += len(rows)
+        if i % 100 == 0 or i == len(relevant):
+            print(f"Candles {i:,}/{len(relevant):,}; rows={raw_count:,}", flush=True)
         time.sleep(0.02)
 
-    write_csv(OUT_DIR / "candles_1min.csv", all_candle_rows)
+    result_rows = []
+    detail_rows = []
 
-    grid, trades = run_grid(sessions, candles_by_ticker)
-    write_csv(OUT_DIR / "grid_results.csv", grid)
-    write_csv(OUT_DIR / "trade_details_all_grid_cells.csv", trades)
+    for policy in ("stop_first","target_first"):
+        for stop in STOP_LEVELS:
+            for target in TARGET_LEVELS:
+                total_n = wins = 0
+                pnl = 0.0
+                stops = targets = closes = 0
 
-    ranked = [r for r in grid if isinstance(r["avg_pnl_per_trade_cents"], (int,float))]
-    ranked.sort(key=lambda r: (r["avg_pnl_per_trade_cents"], r["trades"], r["total_pnl_cents"]), reverse=True)
-    write_csv(OUT_DIR / "grid_ranked_by_avg_pnl.csv", ranked)
+                per_stream = {s["name"]: {"n":0,"pnl":0.0} for s in STREAMS}
 
-    robust = [r for r in ranked if r["trades"] >= 100]
-    write_csv(OUT_DIR / "grid_ranked_min100_trades.csv", robust)
+                for sess in relevant:
+                    stream = choose_stream(sess["prior_streak"])
+                    rows = candle_map.get(sess["ticker"], [])
+                    sim = simulate_trade(sess, rows, stream, stop, target, policy)
+                    if sim is None:
+                        continue
+                    entry, exitp, reason, exit_min = sim
+                    trade_pnl = exitp - entry
+                    pnl += trade_pnl
+                    total_n += 1
+                    if trade_pnl > 0:
+                        wins += 1
+                    if reason == "STOP":
+                        stops += 1
+                    elif reason == "TARGET":
+                        targets += 1
+                    else:
+                        closes += 1
+
+                    per_stream[stream["name"]]["n"] += 1
+                    per_stream[stream["name"]]["pnl"] += trade_pnl
+
+                    detail_rows.append({
+                        "same_candle_policy":policy,
+                        "stop_cents":stop,
+                        "target_cents":target,
+                        "stream":stream["name"],
+                        "streak":stream["streak"],
+                        "entry_limit_cents":entry,
+                        "entry_window_min":stream["window"],
+                        "ticker":sess["ticker"],
+                        "prior_result":sess["prior_result"],
+                        "reversal_side":sess["reversal_side"],
+                        "actual_reversal":sess["actual_reversal"],
+                        "exit_reason":reason,
+                        "exit_minute":exit_min,
+                        "exit_price_cents":exitp,
+                        "pnl_cents":trade_pnl,
+                    })
+
+                row = {
+                    "same_candle_policy":policy,
+                    "stop_cents":stop,
+                    "target_cents":target,
+                    "trades":total_n,
+                    "profitable_trades":wins,
+                    "profitable_trade_pct":round(100*wins/total_n,3) if total_n else "",
+                    "stop_exits":stops,
+                    "target_exits":targets,
+                    "close_exits":closes,
+                    "total_pnl_cents":round(pnl,2),
+                    "avg_pnl_per_trade_cents":round(pnl/total_n,3) if total_n else "",
+                }
+                for s in STREAMS:
+                    d = per_stream[s["name"]]
+                    row[f"{s['name']}_trades"] = d["n"]
+                    row[f"{s['name']}_avg_pnl_cents"] = round(d["pnl"]/d["n"],3) if d["n"] else ""
+                result_rows.append(row)
+
+    # Rank within each same-candle assumption.
+    result_rows.sort(key=lambda r: (r["same_candle_policy"], -(r["avg_pnl_per_trade_cents"] if isinstance(r["avg_pnl_per_trade_cents"],(int,float)) else -999)))
+    write_csv(OUT_DIR/"exit_grid_results.csv", result_rows)
+    write_csv(OUT_DIR/"exit_trade_details.csv", detail_rows)
 
     summary = {
-        "series": SERIES,
-        "selected_market_strike_rows": len(markets),
-        "derived_sessions": len(sessions),
-        "candle_rows": len(all_candle_rows),
-        "candle_markets": len(candles_by_ticker),
-        "date_start": sessions[0]["session_start_utc"] if sessions else "",
-        "date_end": sessions[-1]["close_time"] if sessions else "",
-        "streak_range": [MIN_STREAK, MAX_STREAK],
-        "entry_cents_range": [MIN_ENTRY_CENTS, MAX_ENTRY_CENTS],
-        "window_minutes_range": [MIN_WINDOW_MIN, MAX_WINDOW_MIN],
-        "grid_cells": len(grid),
-        "top_20_min100_trades": robust[:20],
-        "notes": [
+        "series":SERIES,
+        "streams":STREAMS,
+        "stop_levels":STOP_LEVELS,
+        "target_levels":TARGET_LEVELS,
+        "relevant_sessions":len(relevant),
+        "candle_rows":raw_count,
+        "notes":[
             "Kalshi-only public data.",
-            "Outcome uses successive Kalshi strikes, not official settlement.",
-            "Touch means 1-minute reversal ask low <= resting limit.",
-            "Fill assumed at configured limit; fees/slippage not included.",
-            "1-minute candles cannot resolve exact 30-second timing."
+            "Entry fill = 1-minute ask low touch, filled at configured limit.",
+            "Stop uses reversal bid LOW; target uses reversal bid HIGH.",
+            "1-minute candles cannot identify same-candle stop/target ordering.",
+            "Results are reported under both stop-first and target-first assumptions.",
+            "Fees/slippage excluded."
         ],
     }
-    (OUT_DIR / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (OUT_DIR/"run_summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
 
     print("\nDONE")
-    print(f"1-minute candle rows: {len(all_candle_rows):,}")
-    print(f"Grid cells: {len(grid):,}")
-    print(f"Files saved in: {OUT_DIR.resolve()}")
-    if robust:
-        print("\nTop 10 with >=100 trades:")
-        for r in robust[:10]:
-            print(
-                f"s{r['streak']} {r['entry_cents']}c/{r['window_minutes']}m "
-                f"n={r['trades']} win={r['win_rate_pct']}% "
-                f"avg={r['avg_pnl_per_trade_cents']}c total={r['total_pnl_cents']}c"
-            )
+    print(f"Result rows: {len(result_rows):,}")
+    print(f"Trade detail rows: {len(detail_rows):,}")
+    print(f"Saved to: {OUT_DIR.resolve()}")
+    print("\nTop 10 conservative (stop_first):")
+    cons = [r for r in result_rows if r["same_candle_policy"]=="stop_first"]
+    cons.sort(key=lambda r:r["avg_pnl_per_trade_cents"] if isinstance(r["avg_pnl_per_trade_cents"],(int,float)) else -999, reverse=True)
+    for r in cons[:10]:
+        print(f"stop={r['stop_cents']} target={r['target_cents']} n={r['trades']} avg={r['avg_pnl_per_trade_cents']}c total={r['total_pnl_cents']}c")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
