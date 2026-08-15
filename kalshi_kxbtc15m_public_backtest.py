@@ -688,7 +688,29 @@ def main():
         "top_20_min250_trades": [
             r for r in ranked if r["trades"] >= 250
         ][:20],
-        "notes": [
-            "Kalshi-only public data.",
-            "This block skips the newest 5,000 markets to avoid overlap with discovery sample.",
-            "Outcome uses successive Kalshi strikes, not official settlement.",
+        "notes": "Kalshi-only; successive strikes; hold to close; no stop/early sell; checkpointed resume enabled."
+    }
+
+    (OUT_DIR / "run_summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8"
+    )
+
+    print("\nDONE")
+    print(f"1-minute candle rows: {len(all_candle_rows):,}")
+    print(f"Grid cells: {len(grid):,}")
+    print(f"Saved to: {OUT_DIR.resolve()}")
+
+    robust = [r for r in ranked if r["trades"] >= 250]
+    if robust:
+        print("\nTop 15 with >=250 trades:")
+        for r in robust[:15]:
+            print(
+                f"s{r['streak']} {r['entry_cents']}c/{r['window_minutes']}m "
+                f"n={r['trades']} win={r['win_rate_pct']}% "
+                f"avg={r['avg_pnl_per_trade_cents']}c "
+                f"total={r['total_pnl_cents']}c"
+            )
+
+if __name__ == "__main__":
+    main()
