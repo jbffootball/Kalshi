@@ -252,6 +252,22 @@ def authenticated_request(method, path, json_body=None):
     headers = auth_headers(method, path)
     url = BASE_URL + path
 
+    is_entry_post = (
+        method == "POST"
+        and path == "/portfolio/events/orders"
+        and isinstance(json_body, dict)
+        and not json_body.get("reduce_only", False)
+    )
+    if is_entry_post:
+        latency_mark(
+            "POST_START",
+            detail=(
+                f"ticker={json_body.get('ticker','?')} "
+                f"side={json_body.get('side','?')} "
+                f"price={json_body.get('price','?')}"
+            ),
+        )
+
     if method == "GET":
         r = requests.get(url, headers=headers, timeout=15)
     elif method == "POST":
@@ -260,6 +276,9 @@ def authenticated_request(method, path, json_body=None):
         r = requests.delete(url, headers=headers, timeout=15)
     else:
         raise ValueError(f"Unsupported authenticated method: {method}")
+
+    if is_entry_post:
+        latency_mark("POST_RESPONSE", detail=f"http={r.status_code}")
 
     print(f"AUTH {method} {path}: {r.status_code} {r.text[:500]}")
     r.raise_for_status()
@@ -328,6 +347,40 @@ def utc_now():
     return dt.datetime.now(dt.timezone.utc)
 
 
+# LATENCY DIAGNOSTICS ONLY -- no trading-rule changes.
+_latency_boundary_key = None
+_latency_boundary_dt = None
+_latency_seen = set()
+
+
+def latency_reset_if_new_boundary(boundary_dt):
+    global _latency_boundary_key, _latency_boundary_dt, _latency_seen
+    key = boundary_dt.isoformat()
+    if key != _latency_boundary_key:
+        _latency_boundary_key = key
+        _latency_boundary_dt = boundary_dt
+        _latency_seen = set()
+        latency_mark("BOUNDARY", boundary_dt=boundary_dt, force=True)
+
+
+def latency_mark(stage, boundary_dt=None, detail="", force=False):
+    global _latency_seen
+    boundary_dt = boundary_dt or _latency_boundary_dt
+    if boundary_dt is None:
+        return
+    token = (boundary_dt.isoformat(), stage)
+    if token in _latency_seen and not force:
+        return
+    _latency_seen.add(token)
+    now = utc_now()
+    delta = (now - boundary_dt).total_seconds()
+    suffix = f" | {detail}" if detail else ""
+    print(
+        f"LATENCY | {stage:<18} | +{delta:8.3f}s | "
+        f"utc={now.isoformat(timespec='milliseconds')}{suffix}"
+    )
+
+
 def seconds_to_next_15m_boundary(now=None):
     now = now or utc_now()
     seconds_into_block = (now.minute % 15) * 60 + now.second + now.microsecond / 1_000_000
@@ -365,7 +418,7 @@ def get_json(path, params=None):
 
 
 PRICE_TEXT_RE = re.compile(
-    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:Â·-]?\s*\$?\s*"
+    r"(?:price\s+to\s+beat|target\s+price|target)\s*[:ÃÂ·-]?\s*\$?\s*"
     r"([0-9][0-9,]*(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
@@ -1724,6 +1777,10 @@ def place_resting_limit_order(ticker, side, limit_cents, expiration_ts, contract
 
     resp = authenticated_request("POST", "/portfolio/events/orders", json_body=payload)
     order = resp.get("order", resp)
+    latency_mark(
+        "ORDER_ACCEPTED",
+        detail=f"ticker={ticker} order_id={order.get('order_id','?')}",
+    )
     print(f"{MODE.upper()} RESTING LIMIT ORDER ACCEPTED: {order}")
     return order
 
@@ -2324,7 +2381,7 @@ def monitor_position_once(position):
         exit_cents = float(bid)
         print(
             f"REAL MARKET PAPER EXIT: {ticker} {held_side.upper()} "
-            f"qty={exited:g} at observed bid={exit_cents:.1f}c â NO ORDER SENT"
+            f"qty={exited:g} at observed bid={exit_cents:.1f}c Ã¢ÂÂ NO ORDER SENT"
         )
     else:
         exit_order = submit_exit_ioc(ticker, held_side, qty, bid)
@@ -2373,7 +2430,7 @@ def main():
         print("*** KALSHI DEMO ENVIRONMENT / MOCK MONEY ***")
     else:
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! LIVE KALSHI PRODUCTION TRADING â REAL MONEY ENABLED !!!")
+        print("!!! LIVE KALSHI PRODUCTION TRADING Ã¢ÂÂ REAL MONEY ENABLED !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print(f"PRODUCTION TRADE API={BASE_URL}")
         print(
@@ -2449,6 +2506,9 @@ def main():
 
     while True:
         try:
+            _latency_boundary = current_15m_session_start()
+            latency_reset_if_new_boundary(_latency_boundary)
+
             # Build the immediate streak strictly from adjacent Kalshi strikes.
             immediate_markets = successive_strike_markets()
             if outage_backoff_seconds != OUTAGE_BACKOFF_START_SECONDS:
@@ -2500,7 +2560,7 @@ def main():
                             f"REAL MARKET PAPER FILL SLOT {slot_po}: {ticker_po} "
                             f"{po['side'].upper()} qty={po['contracts']:g} "
                             f"limit={fill_cents:.1f}c observed_ask={ask:.1f}c "
-                            f"age={age_text} â NO ORDER SENT"
+                            f"age={age_text} Ã¢ÂÂ NO ORDER SENT"
                         )
                         log_signal(
                             ticker_po, po["trigger_result"], po["trigger_streak"],
@@ -2591,7 +2651,7 @@ def main():
                                 f"REAL MARKET PAPER LIMIT SLOT {slot_name}: {ticker} "
                                 f"buy {side.upper()} {contracts:g} @ {limit_cents:.0f}c "
                                 f"ask={ask_text} age={age:.2f}m window={entry_window:g}m "
-                                f"â NO ORDER SENT"
+                                f"Ã¢ÂÂ NO ORDER SENT"
                             )
 
                 # All paper fills are tracked independently and settled from the
@@ -2645,7 +2705,7 @@ def main():
                         print(
                             f"REAL MARKET PAPER FILL: {ticker} {side.upper()} "
                             f"qty={filled:g} limit={fill_cents:.1f}c "
-                            f"observed_ask={observed_ask:.1f}c age={age_text} â NO ORDER SENT"
+                            f"observed_ask={observed_ask:.1f}c age={age_text} Ã¢ÂÂ NO ORDER SENT"
                         )
                         log_signal(
                             ticker,
@@ -2809,6 +2869,11 @@ def main():
 
                     ticker = market["ticker"]
                     age = market_age_minutes(market)
+                    latency_mark(
+                        "MARKET_VISIBLE",
+                        boundary_dt=pending_api_signal["target_start"],
+                        detail=f"ticker={ticker} age={age:.3f}m",
+                    )
                     side = pending_api_signal["side"]
                     slot_name = pending_api_signal["slot"]
                     limit_cents = pending_api_signal["entry_cents"]
@@ -2866,7 +2931,13 @@ def main():
                         "contracts": contracts,
                         "slot": slot_name,
                     }
+                    _order_target_start = pending_api_signal["target_start"]
                     pending_api_signal = None
+                    latency_mark(
+                        "ORDER_RESTING",
+                        boundary_dt=_order_target_start,
+                        detail=f"ticker={ticker} order_id={order_id}",
+                    )
                     print(
                         f"ORDER RESTING SLOT {slot_name}: {ticker} {side.upper()} "
                         f"@ {limit_cents}c expires={dt.datetime.fromtimestamp(expiration_ts, dt.timezone.utc).isoformat()}"
@@ -2894,6 +2965,21 @@ def main():
                 time.sleep(POLL_ACTIVE_SECONDS)
                 continue
 
+            _latest = immediate_markets[-1] if immediate_markets else {}
+            latency_mark(
+                "NEW_STRIKE_SEEN",
+                boundary_dt=target_start,
+                detail=(
+                    f"derived_close={_latest.get('close_time','?')} "
+                    f"next_ticker={_latest.get('next_ticker','?')}"
+                ),
+            )
+            latency_mark(
+                "STREAK_READY",
+                boundary_dt=target_start,
+                detail=f"last={last_result} streak={streak}",
+            )
+
             # TIE/FLAG deliberately breaks the streak.
             if last_result not in {"yes", "no"}:
                 sleep_idle()
@@ -2904,6 +2990,16 @@ def main():
                 print(f"NO SLOT MATCH: streak={streak}; no order.")
                 sleep_idle()
                 continue
+
+            latency_mark(
+                "SLOT_SELECTED",
+                boundary_dt=target_start,
+                detail=(
+                    f"slot={strategy['name']} streak={streak} "
+                    f"limit={strategy['max_entry_cents']}c "
+                    f"window={strategy['entry_window_minutes']:g}m"
+                ),
+            )
 
             entry_window = strategy["entry_window_minutes"]
             contracts = strategy["contracts"]
@@ -2935,6 +3031,14 @@ def main():
                 "target_start": target_start,
                 "expiration_ts": expiration_ts,
             }
+            latency_mark(
+                "SIGNAL_LOCKED",
+                boundary_dt=target_start,
+                detail=(
+                    f"slot={slot_name} last={last_result} streak={streak} "
+                    f"side={side.upper()} limit={limit_cents}c"
+                ),
+            )
             print(
                 f"SIGNAL LOCKED SLOT {slot_name}: last={last_result} streak={streak} "
                 f"buy={side.upper()} limit={limit_cents}c "
