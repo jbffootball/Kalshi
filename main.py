@@ -8,6 +8,9 @@ import csv
 import json
 import re
 import datetime as dt
+import asyncio
+
+import websockets
 from urllib.parse import urlparse
 from decimal import Decimal, InvalidOperation
 
@@ -15,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "INDEPENDENT_STRIKE_WATCH_V6_2026-08-17"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_DIAGNOSTIC_V7_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -68,12 +71,15 @@ FAST_BOUNDARY_ENABLED = os.getenv("FAST_BOUNDARY_ENABLED", "true").strip().lower
 FAST_DIRECT_RETRY_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_SECONDS", "0.25"))
 FAST_DIRECT_RETRY_MAX_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_MAX_SECONDS", "20"))
 DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
-LIVE_DATA_DIAGNOSTIC_ENABLED = os.getenv("LIVE_DATA_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_DATA_DIAGNOSTIC_ENABLED = os.getenv("LIVE_DATA_DIAGNOSTIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS", "60"))
 LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS", "8"))
-STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED = os.getenv("STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED = os.getenv("STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 STRIKE_VISIBILITY_POLL_SECONDS = float(os.getenv("STRIKE_VISIBILITY_POLL_SECONDS", "2"))
 STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS = float(os.getenv("STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS", "180"))
+CFBENCHMARKS_DIAGNOSTIC_ENABLED = os.getenv("CFBENCHMARKS_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CFBENCHMARKS_INDEX_ID = os.getenv("CFBENCHMARKS_INDEX_ID", "BRTI").strip() or "BRTI"
+CFBENCHMARKS_RECONNECT_SECONDS = float(os.getenv("CFBENCHMARKS_RECONNECT_SECONDS", "3"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
@@ -2922,6 +2928,226 @@ def monitor_position_once(position):
     updated["contracts"] = remaining
     return "partial", updated
 
+
+
+# -----------------------------------------------------------------------------
+# CF BENCHMARKS BRTI WEBSOCKET DIAGNOSTIC -- NO TRADING-RULE CHANGES
+# -----------------------------------------------------------------------------
+_CFB_STATE_LOCK = threading.Lock()
+_CFB_STATE = {
+    "connected": False,
+    "subscribed": False,
+    "last_received_at_ms": None,
+    "last_raw_value": None,
+    "last_final_window_value": None,
+    "last_final_window_size": None,
+    "last_final_window_source_time_ms": None,
+}
+
+
+def websocket_auth_headers():
+    """Kalshi-authenticated WebSocket handshake headers."""
+    if not API_KEY_ID or not PRIVATE_KEY_TEXT.strip():
+        raise RuntimeError(
+            "CFBENCHMARKS diagnostic requires KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY."
+        )
+    timestamp = str(int(time.time() * 1000))
+    path = "/trade-api/ws/v2"
+    message = f"{timestamp}GET{path}".encode("utf-8")
+    signature = load_private_key().sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+    return {
+        "KALSHI-ACCESS-KEY": API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+    }
+
+
+def cfbenchmarks_ws_url():
+    if MODE == "demo":
+        return "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+    return "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+
+
+def _parse_cfb_raw_value(msg):
+    raw = msg.get("data")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None, None
+    if isinstance(raw, dict):
+        value = decimal_or_none(raw.get("value"))
+        source_time = raw.get("time")
+        return value, source_time
+    return None, None
+
+
+def _cfb_boundary_delta_from_source_ms(source_ms):
+    try:
+        source_dt = dt.datetime.fromtimestamp(float(source_ms) / 1000.0, dt.timezone.utc)
+    except Exception:
+        return None, None
+    minute = (source_dt.minute // 15) * 15
+    current_boundary = source_dt.replace(minute=minute, second=0, microsecond=0)
+    # A close tick exactly on the boundary belongs to that boundary. Otherwise the
+    # relevant upcoming quarter-hour close is the next one.
+    if source_dt.second == 0 and source_dt.microsecond == 0 and source_dt.minute % 15 == 0:
+        boundary = source_dt
+    else:
+        boundary = current_boundary + dt.timedelta(minutes=15)
+    delta = (source_dt - boundary).total_seconds()
+    return boundary, delta
+
+
+async def cfbenchmarks_diagnostic_loop():
+    ws_url = cfbenchmarks_ws_url()
+    while CFBENCHMARKS_DIAGNOSTIC_ENABLED:
+        try:
+            headers = websocket_auth_headers()
+            print(
+                f"CFB WS CONNECTING: url={ws_url} index={CFBENCHMARKS_INDEX_ID} mode={MODE}"
+            )
+            async with websockets.connect(
+                ws_url,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+            ) as ws:
+                with _CFB_STATE_LOCK:
+                    _CFB_STATE["connected"] = True
+                    _CFB_STATE["subscribed"] = False
+                print("CFB WS CONNECTED")
+                subscribe = {
+                    "id": 7001,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["cfbenchmarks_value"],
+                        "index_ids": [CFBENCHMARKS_INDEX_ID],
+                    },
+                }
+                await ws.send(json.dumps(subscribe))
+                print(
+                    f"CFB WS SUBSCRIBE SENT: channel=cfbenchmarks_value index={CFBENCHMARKS_INDEX_ID}"
+                )
+
+                async for raw_message in ws:
+                    try:
+                        data = json.loads(raw_message)
+                    except Exception as exc:
+                        print(f"CFB WS JSON WARNING: {exc!r} raw={raw_message[:300]!r}")
+                        continue
+
+                    msg_type = data.get("type")
+                    if msg_type == "subscribed":
+                        with _CFB_STATE_LOCK:
+                            _CFB_STATE["subscribed"] = True
+                        print(f"CFB WS SUBSCRIBED: {json.dumps(data, sort_keys=True)}")
+                        continue
+                    if msg_type == "error":
+                        print(f"CFB WS ERROR MESSAGE: {json.dumps(data, sort_keys=True)}")
+                        continue
+                    if msg_type == "cfbenchmarks_value_indexlist":
+                        print(f"CFB WS INDEXLIST: {json.dumps(data.get('msg', {}), sort_keys=True)}")
+                        continue
+                    if msg_type != "cfbenchmarks_value":
+                        continue
+
+                    msg = data.get("msg") or {}
+                    if msg.get("index_id") != CFBENCHMARKS_INDEX_ID:
+                        continue
+
+                    raw_value, source_time_ms = _parse_cfb_raw_value(msg)
+                    received_at_ms = msg.get("received_at")
+                    final_window = msg.get("last_60s_windowed_average_15min")
+
+                    with _CFB_STATE_LOCK:
+                        _CFB_STATE["last_received_at_ms"] = received_at_ms
+                        _CFB_STATE["last_raw_value"] = format_decimal(raw_value) if raw_value is not None else None
+
+                    if isinstance(final_window, dict):
+                        avg_value = decimal_or_none(final_window.get("value"))
+                        try:
+                            window_size = int(final_window.get("window_size"))
+                        except Exception:
+                            window_size = None
+
+                        boundary, source_delta = _cfb_boundary_delta_from_source_ms(source_time_ms)
+                        boundary_text = boundary.isoformat() if boundary is not None else "?"
+                        delta_text = f"{source_delta:+.3f}s" if source_delta is not None else "?"
+                        print(
+                            "CFB 15M FINAL WINDOW | "
+                            f"index={CFBENCHMARKS_INDEX_ID} size={window_size} "
+                            f"avg={format_decimal(avg_value) or '?'} "
+                            f"raw={format_decimal(raw_value) or '?'} "
+                            f"source_ms={source_time_ms} boundary={boundary_text} t={delta_text}"
+                        )
+
+                        with _CFB_STATE_LOCK:
+                            _CFB_STATE["last_final_window_value"] = (
+                                format_decimal(avg_value) if avg_value is not None else None
+                            )
+                            _CFB_STATE["last_final_window_size"] = window_size
+                            _CFB_STATE["last_final_window_source_time_ms"] = source_time_ms
+
+                        if window_size == 60:
+                            print(
+                                "*** CFB 15M FINAL VALUE READY *** | "
+                                f"index={CFBENCHMARKS_INDEX_ID} "
+                                f"final_avg={format_decimal(avg_value) or '?'} "
+                                f"raw_close_tick={format_decimal(raw_value) or '?'} "
+                                f"boundary={boundary_text} t={delta_text}"
+                            )
+                    else:
+                        # Lightweight heartbeat outside the final minute, at most about once / 10 seconds.
+                        try:
+                            sec = int(float(source_time_ms) / 1000.0) if source_time_ms is not None else 0
+                        except Exception:
+                            sec = 0
+                        if sec % 10 == 0:
+                            print(
+                                "CFB BRTI HEARTBEAT | "
+                                f"raw={format_decimal(raw_value) or '?'} source_ms={source_time_ms} "
+                                "final_window=ABSENT"
+                            )
+        except Exception as exc:
+            with _CFB_STATE_LOCK:
+                _CFB_STATE["connected"] = False
+                _CFB_STATE["subscribed"] = False
+            print(f"CFB WS CONNECTION ERROR: {exc!r}")
+            await asyncio.sleep(max(1.0, CFBENCHMARKS_RECONNECT_SECONDS))
+
+
+def cfbenchmarks_thread_worker():
+    try:
+        asyncio.run(cfbenchmarks_diagnostic_loop())
+    except Exception as exc:
+        print(f"CFB WS THREAD FATAL: {exc!r}")
+
+
+def start_cfbenchmarks_diagnostic_thread():
+    if not CFBENCHMARKS_DIAGNOSTIC_ENABLED:
+        print("CFBENCHMARKS DIAGNOSTIC=OFF")
+        return None
+    print(
+        f"CFBENCHMARKS DIAGNOSTIC=ON index={CFBENCHMARKS_INDEX_ID} "
+        f"reconnect={CFBENCHMARKS_RECONNECT_SECONDS:g}s"
+    )
+    thread = threading.Thread(
+        target=cfbenchmarks_thread_worker,
+        daemon=True,
+        name="cfbenchmarks-brti",
+    )
+    thread.start()
+    print(f"CFB WS THREAD STARTED: alive={thread.is_alive()}")
+    return thread
 
 def main():
     print(f"BUILD VERSION={BUILD_VERSION}", flush=True)
