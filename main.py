@@ -65,7 +65,6 @@ MAX_CLOSE_CAPTURE_LAG_SECONDS = float(os.getenv("MAX_CLOSE_CAPTURE_LAG_SECONDS",
 FAST_BOUNDARY_ENABLED = os.getenv("FAST_BOUNDARY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 FAST_DIRECT_RETRY_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_SECONDS", "0.25"))
 FAST_DIRECT_RETRY_MAX_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_MAX_SECONDS", "20"))
-DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
@@ -602,128 +601,6 @@ def get_crypto_milestones(event_ticker):
     return milestones
 
 
-def _short_json(obj, limit=1800):
-    try:
-        text = json.dumps(obj, sort_keys=True, default=str)
-    except Exception:
-        text = repr(obj)
-    return text if len(text) <= limit else text[:limit] + "...<truncated>"
-
-
-def get_milestone_by_id(milestone_id):
-    """Fetch the authoritative milestone metadata, including its type."""
-    try:
-        payload = get_json(f"/milestones/{milestone_id}")
-        return payload.get("milestone", payload)
-    except Exception as exc:
-        print(f"MILESTONE DETAIL WARNING: id={milestone_id} {exc!r}")
-        return None
-
-
-def fetch_live_data_for_milestone(milestone, start_btc, context="boundary"):
-    """
-    Diagnostic Kalshi-only live-data reader.
-
-    Try the current documented endpoint first. If it returns 404, fetch and
-    print the milestone metadata and also try Kalshi's documented legacy
-    type-specific endpoint. Finally try the documented batch endpoint.
-    No external BTC source is ever used.
-    """
-    milestone_id = (milestone or {}).get("id")
-    if not milestone_id:
-        return None, "", "", ""
-
-    milestone_type = (milestone or {}).get("type") or ""
-    if DEBUG_LIVE_DATA:
-        print(
-            f"LIVE DATA PROBE: context={context} id={milestone_id} "
-            f"type={milestone_type or '?'} title={(milestone or {}).get('title','?')}"
-        )
-
-    # 1) Preferred/current documented endpoint.
-    try:
-        payload = get_json(f"/live_data/milestone/{milestone_id}")
-        live_data = payload.get("live_data", payload)
-        if DEBUG_LIVE_DATA:
-            print(f"LIVE DATA CURRENT OK: id={milestone_id} payload={_short_json(live_data)}")
-        price, path = extract_btc_price_from_live_data(live_data, start_btc)
-        if price is not None:
-            return price, "kalshi_live_data", path, milestone_id
-        print(f"LIVE DATA CURRENT NO BTC CANDIDATE: id={milestone_id} payload={_short_json(live_data)}")
-    except requests.HTTPError as exc:
-        status = http_status_code(exc)
-        body = getattr(getattr(exc, "response", None), "text", "")
-        print(
-            f"LIVE DATA CURRENT HTTP ERROR: id={milestone_id} status={status} "
-            f"body={body[:800]!r}"
-        )
-    except Exception as exc:
-        print(f"LIVE DATA CURRENT ERROR: id={milestone_id} {exc!r}")
-
-    # Refresh metadata so we can see the exact category/type/source ids Kalshi
-    # associates with the milestone that failed above.
-    detail = get_milestone_by_id(milestone_id)
-    if detail:
-        milestone = detail
-        milestone_type = detail.get("type") or milestone_type
-        print(f"MILESTONE DETAIL: {_short_json(detail)}")
-
-    # 2) Legacy documented endpoint that includes the milestone type.
-    if milestone_type:
-        try:
-            payload = get_json(f"/live_data/{milestone_type}/milestone/{milestone_id}")
-            live_data = payload.get("live_data", payload)
-            if DEBUG_LIVE_DATA:
-                print(
-                    f"LIVE DATA LEGACY OK: id={milestone_id} type={milestone_type} "
-                    f"payload={_short_json(live_data)}"
-                )
-            price, path = extract_btc_price_from_live_data(live_data, start_btc)
-            if price is not None:
-                return price, "kalshi_live_data_legacy_typed", path, milestone_id
-            print(
-                f"LIVE DATA LEGACY NO BTC CANDIDATE: id={milestone_id} "
-                f"type={milestone_type} payload={_short_json(live_data)}"
-            )
-        except requests.HTTPError as exc:
-            status = http_status_code(exc)
-            body = getattr(getattr(exc, "response", None), "text", "")
-            print(
-                f"LIVE DATA LEGACY HTTP ERROR: id={milestone_id} type={milestone_type} "
-                f"status={status} body={body[:800]!r}"
-            )
-        except Exception as exc:
-            print(
-                f"LIVE DATA LEGACY ERROR: id={milestone_id} "
-                f"type={milestone_type} {exc!r}"
-            )
-
-    # 3) Documented batch endpoint. requests encodes a one-element list as a
-    # repeated query parameter, matching the API's string[] contract.
-    try:
-        data = get_json("/live_data/batch", {"milestone_ids": [milestone_id]})
-        live_datas = data.get("live_datas", [])
-        if DEBUG_LIVE_DATA:
-            print(f"LIVE DATA BATCH RESPONSE: id={milestone_id} payload={_short_json(live_datas)}")
-        for live_data in live_datas:
-            if str(live_data.get("milestone_id", "")) != str(milestone_id):
-                continue
-            price, path = extract_btc_price_from_live_data(live_data, start_btc)
-            if price is not None:
-                return price, "kalshi_live_data_batch", path, milestone_id
-    except requests.HTTPError as exc:
-        status = http_status_code(exc)
-        body = getattr(getattr(exc, "response", None), "text", "")
-        print(
-            f"LIVE DATA BATCH HTTP ERROR: id={milestone_id} status={status} "
-            f"body={body[:800]!r}"
-        )
-    except Exception as exc:
-        print(f"LIVE DATA BATCH ERROR: id={milestone_id} {exc!r}")
-
-    return None, "", "", milestone_id
-
-
 def fetch_kalshi_displayed_btc(market, start_btc):
     """
     Kalshi-only live BTC display.
@@ -738,11 +615,18 @@ def fetch_kalshi_displayed_btc(market, start_btc):
 
     milestones = get_crypto_milestones(event_ticker)
     for milestone in milestones:
-        price, source, path, milestone_id = fetch_live_data_for_milestone(
-            milestone, start_btc, context="post_close_lookup"
-        )
+        milestone_id = milestone.get("id")
+        if not milestone_id:
+            continue
+        try:
+            payload = get_json(f"/live_data/milestone/{milestone_id}")
+        except Exception as exc:
+            print(f"KALSHI LIVE DATA WARNING: milestone={milestone_id} {exc!r}")
+            continue
+        live_data = payload.get("live_data", payload)
+        price, path = extract_btc_price_from_live_data(live_data, start_btc)
         if price is not None:
-            return price, source, path, milestone_id
+            return price, "kalshi_live_data", path, milestone_id
 
     return None, "", "", ""
 
@@ -802,7 +686,6 @@ def prepare_current_session():
         "close_time": close_time,
         "start_btc": start_btc,
         "start_source": start_source,
-        "milestones": milestones,
         "milestone_ids": milestone_ids,
         "prepared_at": utc_now(),
     }
@@ -813,44 +696,52 @@ def prepare_current_session():
         f"close_time={market.get('close_time')} "
         f"milestones={len(milestone_ids)}"
     )
-    if DEBUG_LIVE_DATA:
-        for m in milestones:
-            print(
-                "PREPARED MILESTONE: "
-                f"id={m.get('id','?')} category={m.get('category','?')} "
-                f"type={m.get('type','?')} source_id={m.get('source_id','?')} "
-                f"title={m.get('title','?')}"
-            )
     return prepared
 
 
 def fetch_prepared_kalshi_close(prepared):
     """
-    Read Kalshi live_data at the boundary using milestone metadata cached before
-    close. The probe logs enough information to diagnose 404s and tries only
-    documented Kalshi live-data endpoints; no external BTC source is used.
+    Read Kalshi live_data at the boundary using milestone IDs cached before
+    close. This deliberately avoids rediscovering the market after it closes.
     """
     start_btc = prepared.get("start_btc")
-    milestones = prepared.get("milestones") or []
+    for milestone_id in prepared.get("milestone_ids") or []:
+        try:
+            payload = get_json(f"/live_data/milestone/{milestone_id}")
+        except Exception as exc:
+            print(
+                f"KALSHI LIVE DATA WARNING: milestone={milestone_id} "
+                f"{exc!r}"
+            )
+            continue
 
-    # Backward compatibility if an older prepared object contains IDs only.
-    if not milestones:
-        milestones = [{"id": mid} for mid in (prepared.get("milestone_ids") or [])]
+        live_data = payload.get("live_data", payload)
 
-    last_mid = ""
-    for milestone in milestones:
-        last_mid = milestone.get("id") or last_mid
-        price, source, path, milestone_id = fetch_live_data_for_milestone(
-            milestone, start_btc, context="exact_boundary"
-        )
+        if DEBUG_LIVE_DATA:
+            try:
+                print(
+                    "LIVE DATA RAW: "
+                    + json.dumps(
+                        {
+                            "milestone_id": milestone_id,
+                            "live_data": live_data,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception as exc:
+                print(f"LIVE DATA RAW LOG ERROR: {exc!r}")
+
+        price, path = extract_btc_price_from_live_data(live_data, start_btc)
         if price is not None:
             print(
                 f"LIVE DATA EXTRACTED: milestone={milestone_id} "
-                f"path={path} value={format_decimal(price)} source={source}"
+                f"path={path} value={format_decimal(price)}"
             )
-            return price, source, path, milestone_id
+            return price, "kalshi_live_data_cached_milestone", path, milestone_id
 
-    return None, "", "", last_mid
+    return None, "", "", ""
 
 
 def capture_prepared_session(prepared):
