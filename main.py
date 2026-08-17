@@ -62,6 +62,9 @@ ORDER_RETRY_SECONDS = float(os.getenv("ORDER_RETRY_SECONDS", "2"))
 RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "1"))
 WAKE_BEFORE_BOUNDARY_SECONDS = float(os.getenv("WAKE_BEFORE_BOUNDARY_SECONDS", "3"))
 MAX_CLOSE_CAPTURE_LAG_SECONDS = float(os.getenv("MAX_CLOSE_CAPTURE_LAG_SECONDS", "3"))
+FAST_BOUNDARY_ENABLED = os.getenv("FAST_BOUNDARY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+FAST_DIRECT_RETRY_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_SECONDS", "0.25"))
+FAST_DIRECT_RETRY_MAX_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_MAX_SECONDS", "20"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
@@ -1558,6 +1561,103 @@ def market_for_session_start(open_markets, session_start):
     return None
 
 
+def preidentify_market_for_session_start(session_start):
+    """Try to cache the exact next-session ticker before its session begins."""
+    queries = [
+        {"series_ticker": SERIES, "status": "unopened", "limit": 100},
+        {"series_ticker": SERIES, "limit": 100},
+    ]
+    for params in queries:
+        try:
+            data = get_json("/markets", params)
+        except Exception as exc:
+            print(f"FAST PREIDENTIFY WARNING: {exc!r}")
+            continue
+
+        for market in data.get("markets", []):
+            start = btc_session_start(market)
+            if start is not None and start == session_start and market.get("ticker"):
+                print(
+                    f"FAST PREIDENTIFIED: target_start={session_start.isoformat()} "
+                    f"ticker={market.get('ticker')} status={market.get('status','?')}"
+                )
+                return market
+    return None
+
+
+def latest_fast_boundary_row(target_start):
+    """Return our Kalshi live-data capture for the session ending at target_start."""
+    for row in reversed(read_session_log()):
+        close_dt = parse_time(row.get("close_time_utc"))
+        if close_dt == target_start:
+            return row
+    return None
+
+
+def fast_streak_view(immediate_markets, target_start):
+    """Append the instantaneous boundary outcome if the formal strike is not ready."""
+    fast_row = latest_fast_boundary_row(target_start)
+    if not fast_row:
+        return immediate_markets, None
+
+    result = (fast_row.get("immediate_result") or "").lower()
+    if result not in {"yes", "no", "tie"}:
+        return immediate_markets, fast_row
+
+    if latest_result_confirms_boundary(immediate_markets, target_start):
+        return immediate_markets, fast_row
+
+    synthetic = {
+        "ticker": fast_row.get("ticker") or "",
+        "close_time": target_start.isoformat(),
+        "result": result,
+        "source": "instant_kalshi_boundary_price",
+        "kalshi_start_btc": fast_row.get("kalshi_start_btc") or "",
+        "kalshi_close_btc": fast_row.get("kalshi_close_btc") or "",
+    }
+    return list(immediate_markets) + [synthetic], fast_row
+
+
+def direct_submit_preidentified(pending):
+    """Try the cached ticker directly, without waiting for open-market visibility."""
+    ticker = pending.get("ticker_hint")
+    if not ticker:
+        return "no_hint", None
+
+    deadline = min(
+        pending["expiration_ts"],
+        utc_now().timestamp() + FAST_DIRECT_RETRY_MAX_SECONDS,
+    )
+    attempt = 0
+    while utc_now().timestamp() < deadline:
+        attempt += 1
+        age = (utc_now() - pending["target_start"]).total_seconds() / 60.0
+        latency_mark(
+            "DIRECT_POST_TRY",
+            boundary_dt=pending["target_start"],
+            detail=f"ticker={ticker} attempt={attempt} age={age:.3f}m",
+            force=True,
+        )
+        status, order = submit_resting_order_with_retry(
+            ticker,
+            pending["side"],
+            pending["entry_cents"],
+            pending["expiration_ts"],
+            pending["contracts"],
+        )
+        if status == "accepted" and order:
+            return "accepted", order
+        if status not in {"market_not_found", "failed"}:
+            return status, order
+
+        remaining = deadline - utc_now().timestamp()
+        if remaining <= 0:
+            break
+        time.sleep(min(FAST_DIRECT_RETRY_SECONDS, remaining))
+
+    return "not_ready", None
+
+
 def latest_result_confirms_boundary(immediate_markets, target_start):
     """
     True only after the successive-strike dataset contains the result for the
@@ -2450,8 +2550,8 @@ def main():
             f"window={slot['entry_window_minutes']:g}m "
             f"contracts={slot['contracts']:g}"
         )
-    print("OUTCOME METHOD=successive Kalshi session strikes only")
-    print("BOUNDARY CONFIRMATION=ON; no entry until just-ended session is derived from new strike")
+    print("OUTCOME METHOD=instant Kalshi boundary BTC for live decision; successive strikes retained for history/diagnostics")
+    print("FAST BOUNDARY=ON; no wait for next formal strike when Kalshi live BTC capture is available")
     print("SESSION CLOCK=close_time - 15 minutes")
     print("FUTURE STRIKE GUARD=enabled; future sessions excluded")
     print("OFFICIAL RESULT=not used")
@@ -2501,6 +2601,8 @@ def main():
         if r.get("ticker") and r.get("slot")
     }
     last_sequence_ticker = None
+    prepared_fast_session = None
+    preidentified_next_market = None
 
     print_current_strategy_summary()
 
@@ -2509,7 +2611,44 @@ def main():
             _latency_boundary = current_15m_session_start()
             latency_reset_if_new_boundary(_latency_boundary)
 
-            # Build the immediate streak strictly from adjacent Kalshi strikes.
+            # SPEED-FIRST path: prepare before close and capture Kalshi's own
+            # live BTC value exactly at the boundary.
+            if FAST_BOUNDARY_ENABLED:
+                if prepared_fast_session is None:
+                    prepared_fast_session = prepare_current_session()
+                    if prepared_fast_session is not None:
+                        target = prepared_fast_session.get("close_time")
+                        if target is not None:
+                            preidentified_next_market = preidentify_market_for_session_start(target)
+
+                if prepared_fast_session is not None:
+                    target = prepared_fast_session.get("close_time")
+                    if target is not None and (
+                        preidentified_next_market is None
+                        or btc_session_start(preidentified_next_market) != target
+                    ):
+                        preidentified_next_market = preidentify_market_for_session_start(target)
+
+                    captured, prepared_fast_session = capture_prepared_if_due(
+                        prepared_fast_session
+                    )
+                    if captured:
+                        boundary_dt = current_15m_session_start()
+                        latency_reset_if_new_boundary(boundary_dt)
+                        row = latest_fast_boundary_row(boundary_dt)
+                        if row:
+                            latency_mark(
+                                "FAST_PRICE_CAPTURE",
+                                boundary_dt=boundary_dt,
+                                detail=(
+                                    f"start={row.get('kalshi_start_btc','?')} "
+                                    f"close={row.get('kalshi_close_btc','?')} "
+                                    f"result={row.get('immediate_result','?')} "
+                                    f"lag={row.get('close_capture_lag_seconds','?')}s"
+                                ),
+                            )
+
+            # Keep formal successive strikes for prior history and diagnostics.
             immediate_markets = successive_strike_markets()
             if outage_backoff_seconds != OUTAGE_BACKOFF_START_SECONDS:
                 print("KALSHI API RECOVERED: normal polling resumed.")
@@ -2852,6 +2991,60 @@ def main():
                     )
                     pending_api_signal = None
                 else:
+                    # First choice: submit straight to the ticker cached before
+                    # the boundary. Do not wait for the open-market list.
+                    if pending_api_signal.get("ticker_hint"):
+                        ticker_hint = pending_api_signal["ticker_hint"]
+                        status, order = direct_submit_preidentified(pending_api_signal)
+                        if status == "accepted" and order:
+                            ticker = ticker_hint
+                            age = (
+                                utc_now() - pending_api_signal["target_start"]
+                            ).total_seconds() / 60.0
+                            side = pending_api_signal["side"]
+                            slot_name = pending_api_signal["slot"]
+                            limit_cents = pending_api_signal["entry_cents"]
+                            contracts = pending_api_signal["contracts"]
+                            expiration_ts = pending_api_signal["expiration_ts"]
+                            trigger_result = pending_api_signal["trigger_result"]
+                            trigger_streak = pending_api_signal["trigger_streak"]
+                            order_id = order.get("order_id")
+                            current_order = {
+                                "order_id": order_id,
+                                "ticker": ticker,
+                                "side": side,
+                                "entry_cents": limit_cents,
+                                "expiration_ts": expiration_ts,
+                                "trigger_result": trigger_result,
+                                "trigger_streak": trigger_streak,
+                                "age_at_submit": age,
+                                "contracts": contracts,
+                                "slot": slot_name,
+                            }
+                            _order_target_start = pending_api_signal["target_start"]
+                            pending_api_signal = None
+                            latency_mark(
+                                "DIRECT_ACCEPTED",
+                                boundary_dt=_order_target_start,
+                                detail=f"ticker={ticker} order_id={order_id}",
+                            )
+                            latency_mark(
+                                "ORDER_RESTING",
+                                boundary_dt=_order_target_start,
+                                detail=f"ticker={ticker} order_id={order_id}",
+                            )
+                            print(
+                                f"FAST DIRECT ORDER RESTING SLOT {slot_name}: "
+                                f"{ticker} {side.upper()} @ {limit_cents}c"
+                            )
+                            time.sleep(POLL_ORDER_SECONDS)
+                            continue
+                        if status == "not_ready":
+                            print(
+                                f"FAST DIRECT TICKER NOT READY: {ticker_hint}; "
+                                "falling back to normal market discovery."
+                            )
+
                     open_markets = get_open_markets()
                     market = market_for_session_start(
                         open_markets, pending_api_signal["target_start"]
@@ -2946,34 +3139,44 @@ def main():
                     continue
 
             # --------------------------------------------------------------
-            # DEMO/LIVE BOUNDARY CONFIRMATION
+            # DEMO/LIVE SPEED-FIRST BOUNDARY DECISION
             # --------------------------------------------------------------
-            # Never use the previous streak at a new 15-minute boundary. Wait
-            # until the new Kalshi strike is present and therefore the session
-            # that just ended has been derived. Only then may we evaluate streak.
             target_start = current_15m_session_start()
-            if not latest_result_confirms_boundary(immediate_markets, target_start):
-                latest_close = (
-                    immediate_markets[-1].get("close_time")
-                    if immediate_markets else "none"
+            latency_reset_if_new_boundary(target_start)
+
+            decision_markets, fast_row = fast_streak_view(
+                immediate_markets, target_start
+            )
+            fast_ready = (
+                fast_row is not None
+                and (fast_row.get("immediate_result") or "").lower()
+                in {"yes", "no", "tie"}
+            )
+
+            if FAST_BOUNDARY_ENABLED and fast_ready:
+                last_result, streak = calculate_streak(decision_markets)
+                latency_mark(
+                    "FAST_RESULT_READY",
+                    boundary_dt=target_start,
+                    detail=(
+                        f"last={last_result} streak={streak} "
+                        f"start={fast_row.get('kalshi_start_btc','?')} "
+                        f"boundary={fast_row.get('kalshi_close_btc','?')}"
+                    ),
                 )
                 print(
-                    f"BOUNDARY WAIT: target_start={target_start.isoformat()} "
-                    f"latest_derived_close={latest_close}; "
-                    f"refusing to lock/place an order from stale streak={streak}."
+                    f"FAST BOUNDARY RESULT: last={last_result} streak={streak}; "
+                    "formal next strike NOT awaited."
                 )
-                time.sleep(POLL_ACTIVE_SECONDS)
+            else:
+                print(
+                    f"FAST BOUNDARY SKIP: target_start={target_start.isoformat()} "
+                    "instantaneous Kalshi boundary price unavailable; "
+                    "not waiting for a formal strike."
+                )
+                sleep_idle()
                 continue
 
-            _latest = immediate_markets[-1] if immediate_markets else {}
-            latency_mark(
-                "NEW_STRIKE_SEEN",
-                boundary_dt=target_start,
-                detail=(
-                    f"derived_close={_latest.get('close_time','?')} "
-                    f"next_ticker={_latest.get('next_ticker','?')}"
-                ),
-            )
             latency_mark(
                 "STREAK_READY",
                 boundary_dt=target_start,
@@ -3030,6 +3233,12 @@ def main():
                 "contracts": float(contracts),
                 "target_start": target_start,
                 "expiration_ts": expiration_ts,
+                "ticker_hint": (
+                    preidentified_next_market.get("ticker")
+                    if preidentified_next_market is not None
+                    and btc_session_start(preidentified_next_market) == target_start
+                    else None
+                ),
             }
             latency_mark(
                 "SIGNAL_LOCKED",
