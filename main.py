@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_DIAGNOSTIC_V7_2026-08-17"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_DIAGNOSTIC_V8_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -3154,6 +3154,7 @@ def main():
     print("*** THIS BUILD MUST PRINT ONE-MINUTE LIVE-DATA PROBE HEARTBEATS ***", flush=True)
     ensure_trade_log()
     ensure_session_log()
+    start_cfbenchmarks_diagnostic_thread()
 
     print("KALSHI BTC 15-MINUTE STREAK BOT")
     if MODE == "paper":
