@@ -15,7 +15,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "FAST_BOUNDARY_MINUTE_PROBE_V2_2026-08-17"
+BUILD_VERSION = "FAST_BOUNDARY_BATCH_DIAGNOSTIC_V3_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -703,28 +703,79 @@ def fetch_live_data_for_milestone(milestone, start_btc, context="boundary"):
                 f"type={milestone_type} {exc!r}"
             )
 
-    # 3) Documented batch endpoint. requests encodes a one-element list as a
-    # repeated query parameter, matching the API's string[] contract.
+    # 3) Documented batch endpoint. Diagnostic V3 deliberately logs the raw
+    # response shape before attempting to parse it. Kalshi may return a list,
+    # a dict keyed by milestone id, or a nested object depending on endpoint
+    # behavior/version. Do not assume iterability here.
     try:
         data = get_json("/live_data/batch", {"milestone_ids": [milestone_id]})
-        live_datas = data.get("live_datas", [])
-        if DEBUG_LIVE_DATA:
-            print(f"LIVE DATA BATCH RESPONSE: id={milestone_id} payload={_short_json(live_datas)}")
-        for live_data in live_datas:
-            if str(live_data.get("milestone_id", "")) != str(milestone_id):
+        print(
+            f"LIVE DATA BATCH RAW: id={milestone_id} "
+            f"python_type={type(data).__name__} payload={_short_json(data, limit=4000)}"
+        )
+
+        # Collect plausible live-data objects without assuming one response shape.
+        candidates = []
+        if isinstance(data, list):
+            candidates.extend(x for x in data if isinstance(x, dict))
+        elif isinstance(data, dict):
+            # Common wrappers first.
+            for key in ("live_datas", "live_data", "data", "results", "milestones"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    candidates.extend(x for x in value if isinstance(x, dict))
+                elif isinstance(value, dict):
+                    # Could itself be one live-data object or a mapping by id.
+                    candidates.append(value)
+                    candidates.extend(x for x in value.values() if isinstance(x, dict))
+
+            # Also inspect top-level values in case the payload is keyed by milestone id.
+            candidates.extend(x for x in data.values() if isinstance(x, dict))
+
+            # Finally include the whole dict itself; the extractor is conservative.
+            candidates.append(data)
+
+        # De-duplicate dict objects by serialized form for cleaner diagnostics.
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            try:
+                marker = json.dumps(candidate, sort_keys=True, default=str)
+            except Exception:
+                marker = repr(candidate)
+            if marker in seen:
                 continue
+            seen.add(marker)
+            unique.append(candidate)
+
+        print(
+            f"LIVE DATA BATCH PARSE: id={milestone_id} "
+            f"candidate_dicts={len(unique)}"
+        )
+
+        for idx, live_data in enumerate(unique):
+            print(
+                f"LIVE DATA BATCH CANDIDATE[{idx}]: id={milestone_id} "
+                f"payload={_short_json(live_data, limit=2500)}"
+            )
             price, path = extract_btc_price_from_live_data(live_data, start_btc)
             if price is not None:
+                print(
+                    f"LIVE DATA BATCH BTC FOUND: id={milestone_id} "
+                    f"candidate={idx} path={path} value={format_decimal(price)}"
+                )
                 return price, "kalshi_live_data_batch", path, milestone_id
+
+        print(f"LIVE DATA BATCH NO BTC CANDIDATE: id={milestone_id}")
     except requests.HTTPError as exc:
         status = http_status_code(exc)
         body = getattr(getattr(exc, "response", None), "text", "")
         print(
             f"LIVE DATA BATCH HTTP ERROR: id={milestone_id} status={status} "
-            f"body={body[:800]!r}"
+            f"body={body[:1200]!r}"
         )
     except Exception as exc:
-        print(f"LIVE DATA BATCH ERROR: id={milestone_id} {exc!r}")
+        print(f"LIVE DATA BATCH ERROR: id={milestone_id} {type(exc).__name__}: {exc!r}")
 
     return None, "", "", milestone_id
 
