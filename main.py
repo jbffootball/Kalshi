@@ -15,7 +15,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "UNOPENED_STRIKE_DIAGNOSTIC_V5_2026-08-17"
+BUILD_VERSION = "INDEPENDENT_STRIKE_WATCH_V6_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -72,7 +72,7 @@ LIVE_DATA_DIAGNOSTIC_ENABLED = os.getenv("LIVE_DATA_DIAGNOSTIC_ENABLED", "true")
 LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS", "60"))
 LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS", "8"))
 STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED = os.getenv("STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-STRIKE_VISIBILITY_POLL_SECONDS = float(os.getenv("STRIKE_VISIBILITY_POLL_SECONDS", "3"))
+STRIKE_VISIBILITY_POLL_SECONDS = float(os.getenv("STRIKE_VISIBILITY_POLL_SECONDS", "2"))
 STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS = float(os.getenv("STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS", "180"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
@@ -1821,6 +1821,7 @@ def strike_visibility_diagnostic_worker():
     first_strike = None
     last_signature = None
     last_heartbeat = 0.0
+    watcher_started = utc_now()
 
     while True:
         try:
@@ -1831,7 +1832,7 @@ def strike_visibility_diagnostic_worker():
                 first_visible = None
                 first_strike = None
                 last_signature = None
-                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}")
+                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}", flush=True)
 
             # Keep following the same target for a few minutes after boundary so
             # we can measure delayed publication precisely.
@@ -1841,7 +1842,7 @@ def strike_visibility_diagnostic_worker():
                 first_visible = None
                 first_strike = None
                 last_signature = None
-                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}")
+                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}", flush=True)
 
             market, catalog_status, errors = _strike_diag_market_snapshot(target)
             now = utc_now()
@@ -1854,14 +1855,27 @@ def strike_visibility_diagnostic_worker():
                 )
 
             if market is None:
-                # Heartbeat once per minute so absence itself is visible without log spam.
-                if now.timestamp() - last_heartbeat >= 60:
+                # V6: heartbeat every 10 seconds so the watcher cannot be mistaken for dead.
+                if now.timestamp() - last_heartbeat >= 10:
                     print(
                         f"STRIKE WATCH HEARTBEAT: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s visible=NO strike=NO"
+                        f"t={rel:+.3f}s visible=NO strike=NO "
+                        f"watcher_uptime={(now-watcher_started).total_seconds():.1f}s",
+                        flush=True,
                     )
                     last_heartbeat = now.timestamp()
             else:
+                if now.timestamp() - last_heartbeat >= 10:
+                    strike_hb, source_hb = extract_kalshi_start_btc(market)
+                    print(
+                        f"STRIKE WATCH HEARTBEAT: target_start={target.isoformat()} "
+                        f"t={rel:+.3f}s visible=YES ticker={market.get('ticker','?')} "
+                        f"status={market.get('status','?')} "
+                        f"strike={format_decimal(strike_hb) or 'NONE'} "
+                        f"source={source_hb or 'NONE'}",
+                        flush=True,
+                    )
+                    last_heartbeat = now.timestamp()
                 if first_visible is None:
                     first_visible = now
                     print(
@@ -1916,12 +1930,18 @@ def start_strike_visibility_diagnostic():
     if not STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED:
         print("STRIKE VISIBILITY DIAGNOSTIC=OFF")
         return
+    print(
+        f"STRIKE WATCH THREAD STARTING: poll={STRIKE_VISIBILITY_POLL_SECONDS:g}s "
+        f"after_boundary={STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:g}s",
+        flush=True,
+    )
     thread = threading.Thread(
         target=strike_visibility_diagnostic_worker,
         daemon=True,
         name="strike-visibility-diagnostic",
     )
     thread.start()
+    print(f"STRIKE WATCH THREAD STARTED: alive={thread.is_alive()}", flush=True)
 
 def preidentify_market_for_session_start(session_start):
     """Try to cache the exact next-session ticker before its session begins."""
