@@ -15,7 +15,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "FAST_BOUNDARY_SOURCE_GUARD_V4_2026-08-17"
+BUILD_VERSION = "UNOPENED_STRIKE_DIAGNOSTIC_V5_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -71,6 +71,9 @@ DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() in {"1", 
 LIVE_DATA_DIAGNOSTIC_ENABLED = os.getenv("LIVE_DATA_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS", "60"))
 LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS", "8"))
+STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED = os.getenv("STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+STRIKE_VISIBILITY_POLL_SECONDS = float(os.getenv("STRIKE_VISIBILITY_POLL_SECONDS", "3"))
+STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS = float(os.getenv("STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS", "180"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
@@ -1775,6 +1778,151 @@ def market_for_session_start(open_markets, session_start):
     return None
 
 
+
+
+def _strike_diag_market_snapshot(target_start):
+    """Return the exact KXBTC15M market for target_start from unopened/open catalogs."""
+    found = []
+    errors = []
+    for status in ("unopened", "open"):
+        try:
+            data = get_json("/markets", {
+                "series_ticker": SERIES,
+                "status": status,
+                "limit": 200,
+            })
+            for market in data.get("markets", []):
+                start = btc_session_start(market)
+                if start is not None and start == target_start:
+                    found.append((status, market))
+        except Exception as exc:
+            errors.append(f"{status}:{exc!r}")
+    if found:
+        # Prefer open if both catalogs briefly contain the market.
+        found.sort(key=lambda x: 1 if x[0] == "open" else 0, reverse=True)
+        return found[0][1], found[0][0], errors
+    return None, "", errors
+
+
+def strike_visibility_diagnostic_worker():
+    """
+    Diagnostic only. Watches one upcoming session across its boundary and logs:
+      * first time the exact ticker is visible
+      * first time its Kalshi strike is readable
+      * status/strike-field changes
+    It never mutates trading state or submits/cancels orders.
+    """
+    print(
+        f"STRIKE VISIBILITY DIAGNOSTIC=ON poll={STRIKE_VISIBILITY_POLL_SECONDS:g}s "
+        f"after_boundary={STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:g}s"
+    )
+    target = None
+    first_visible = None
+    first_strike = None
+    last_signature = None
+    last_heartbeat = 0.0
+
+    while True:
+        try:
+            now = utc_now()
+            if target is None:
+                base = current_15m_session_start(now)
+                target = base + dt.timedelta(minutes=15)
+                first_visible = None
+                first_strike = None
+                last_signature = None
+                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}")
+
+            # Keep following the same target for a few minutes after boundary so
+            # we can measure delayed publication precisely.
+            seconds_from_boundary = (now - target).total_seconds()
+            if seconds_from_boundary > STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:
+                target = target + dt.timedelta(minutes=15)
+                first_visible = None
+                first_strike = None
+                last_signature = None
+                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}")
+
+            market, catalog_status, errors = _strike_diag_market_snapshot(target)
+            now = utc_now()
+            rel = (now - target).total_seconds()
+
+            if errors and DEBUG_LIVE_DATA:
+                print(
+                    f"STRIKE WATCH API WARNING: target_start={target.isoformat()} "
+                    + " | ".join(errors)
+                )
+
+            if market is None:
+                # Heartbeat once per minute so absence itself is visible without log spam.
+                if now.timestamp() - last_heartbeat >= 60:
+                    print(
+                        f"STRIKE WATCH HEARTBEAT: target_start={target.isoformat()} "
+                        f"t={rel:+.3f}s visible=NO strike=NO"
+                    )
+                    last_heartbeat = now.timestamp()
+            else:
+                if first_visible is None:
+                    first_visible = now
+                    print(
+                        f"STRIKE TICKER FIRST VISIBLE: target_start={target.isoformat()} "
+                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
+                        f"catalog_status={catalog_status} market_status={market.get('status','?')}"
+                    )
+
+                strike, strike_source = extract_kalshi_start_btc(market)
+                raw_fields = {
+                    "floor_strike": market.get("floor_strike"),
+                    "cap_strike": market.get("cap_strike"),
+                    "functional_strike": market.get("functional_strike"),
+                    "custom_strike": market.get("custom_strike"),
+                    "yes_sub_title": market.get("yes_sub_title"),
+                    "subtitle": market.get("subtitle"),
+                    "title": market.get("title"),
+                }
+                signature = (
+                    market.get("ticker"), catalog_status, market.get("status"),
+                    format_decimal(strike), strike_source,
+                    json.dumps(raw_fields, sort_keys=True, default=str),
+                )
+                if signature != last_signature:
+                    print(
+                        f"STRIKE WATCH SNAPSHOT: target_start={target.isoformat()} "
+                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
+                        f"catalog_status={catalog_status} market_status={market.get('status','?')} "
+                        f"strike={format_decimal(strike) or '?'} source={strike_source or '?'} "
+                        f"fields={json.dumps(raw_fields, sort_keys=True, default=str)}"
+                    )
+                    last_signature = signature
+
+                if strike is not None and first_strike is None:
+                    first_strike = now
+                    visible_delay = (first_strike - first_visible).total_seconds() if first_visible else 0.0
+                    print(
+                        f"STRIKE FIRST READABLE: target_start={target.isoformat()} "
+                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
+                        f"strike={format_decimal(strike)} source={strike_source} "
+                        f"after_ticker_visible={visible_delay:.3f}s"
+                    )
+
+            time.sleep(max(1.0, STRIKE_VISIBILITY_POLL_SECONDS))
+
+        except Exception as exc:
+            print(f"STRIKE VISIBILITY DIAGNOSTIC ERROR: {exc!r}")
+            time.sleep(max(2.0, STRIKE_VISIBILITY_POLL_SECONDS))
+
+
+def start_strike_visibility_diagnostic():
+    if not STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED:
+        print("STRIKE VISIBILITY DIAGNOSTIC=OFF")
+        return
+    thread = threading.Thread(
+        target=strike_visibility_diagnostic_worker,
+        daemon=True,
+        name="strike-visibility-diagnostic",
+    )
+    thread.start()
+
 def preidentify_market_for_session_start(session_start):
     """Try to cache the exact next-session ticker before its session begins."""
     queries = [
@@ -2851,6 +2999,7 @@ def main():
     next_live_data_diagnostic_ts = 0.0
 
     print_current_strategy_summary()
+    start_strike_visibility_diagnostic()
 
     while True:
         try:
