@@ -15,7 +15,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "FAST_BOUNDARY_BATCH_DIAGNOSTIC_V3_2026-08-17"
+BUILD_VERSION = "FAST_BOUNDARY_SOURCE_GUARD_V4_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -1799,12 +1799,36 @@ def preidentify_market_for_session_start(session_start):
     return None
 
 
+FAST_LIVE_SOURCES = {
+    "kalshi_live_data",
+    "kalshi_live_data_cached_milestone",
+    "kalshi_live_data_legacy_typed",
+    "kalshi_live_data_batch",
+}
+
+
 def latest_fast_boundary_row(target_start):
-    """Return our Kalshi live-data capture for the session ending at target_start."""
+    """Return ONLY a true Kalshi live-data capture for target_start.
+
+    Successive-strike history rows share the same session log, but they are
+    delayed observations and must never masquerade as an instantaneous fast
+    boundary result.
+    """
     for row in reversed(read_session_log()):
         close_dt = parse_time(row.get("close_time_utc"))
-        if close_dt == target_start:
+        if close_dt != target_start:
+            continue
+
+        source = (row.get("close_price_source") or "").strip()
+        if source in FAST_LIVE_SOURCES:
             return row
+
+        if source:
+            print(
+                f"FAST SOURCE GUARD: rejecting {row.get('ticker','?')} "
+                f"source={source} for target_start={target_start.isoformat()}",
+                flush=True,
+            )
     return None
 
 
