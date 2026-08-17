@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_DIAGNOSTIC_V8_2026-08-17"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_V10_2026-08-17"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -80,6 +80,9 @@ STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS = float(os.getenv("STRIKE_VISIBILITY_AF
 CFBENCHMARKS_DIAGNOSTIC_ENABLED = os.getenv("CFBENCHMARKS_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CFBENCHMARKS_INDEX_ID = os.getenv("CFBENCHMARKS_INDEX_ID", "BRTI").strip() or "BRTI"
 CFBENCHMARKS_RECONNECT_SECONDS = float(os.getenv("CFBENCHMARKS_RECONNECT_SECONDS", "3"))
+CFBENCHMARKS_TRADING_TRIGGER_ENABLED = os.getenv("CFBENCHMARKS_TRADING_TRIGGER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CFBENCHMARKS_FINAL_WAIT_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_WAIT_SECONDS", "3"))
+CFBENCHMARKS_FINAL_POLL_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_POLL_SECONDS", "0.01"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
@@ -152,6 +155,14 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_C_MAX_ENTRY_CENTS", "45")),
         "entry_window_minutes": float(os.getenv("STREAK_C_ENTRY_WINDOW_MINUTES", "5")),
         "contracts": float(os.getenv("STREAK_C_CONTRACTS", "1")),
+    },
+    {
+        "name": "D",
+        "enabled": env_bool("STREAK_D_ENABLED", True),
+        "streak": int(os.getenv("STREAK_D_LENGTH", "4")),
+        "max_entry_cents": int(os.getenv("STREAK_D_MAX_ENTRY_CENTS", "27")),
+        "entry_window_minutes": float(os.getenv("STREAK_D_ENTRY_WINDOW_MINUTES", "5")),
+        "contracts": float(os.getenv("STREAK_D_CONTRACTS", "1")),
     },
 ]
 
@@ -1383,6 +1394,11 @@ def persist_successive_strike_results(derived):
 
     for d in derived:
         ticker = d["ticker"]
+        prior_row = existing.get(ticker)
+        if prior_row and (prior_row.get("close_price_source") or "").strip() == "kalshi_cfbenchmarks_brti_15m_final":
+            # Preserve the exact BRTI boundary capture. Successive strike remains
+            # a diagnostic cross-check and must not overwrite the trading source.
+            continue
         row = {
             "captured_time_utc": utc_now().isoformat(timespec="seconds"),
             "ticker": ticker,
@@ -1710,7 +1726,7 @@ def print_current_strategy_summary(rows=None):
         f"avg_pnl_per_trade={avg}"
     )
 
-    for slot in ("A", "B", "C"):
+    for slot in ("A", "B", "C", "D"):
         slot_rows = [r for r in rows if r.get("slot") == slot]
         if not slot_rows:
             continue
@@ -1978,6 +1994,7 @@ FAST_LIVE_SOURCES = {
     "kalshi_live_data_cached_milestone",
     "kalshi_live_data_legacy_typed",
     "kalshi_live_data_batch",
+    "kalshi_cfbenchmarks_brti_15m_final",
 }
 
 
@@ -3125,6 +3142,120 @@ async def cfbenchmarks_diagnostic_loop():
             await asyncio.sleep(max(1.0, CFBENCHMARKS_RECONNECT_SECONDS))
 
 
+
+def cfb_final_value_for_boundary(boundary_dt):
+    """Return the BRTI quarter-hour final-minute average for exactly boundary_dt."""
+    with _CFB_STATE_LOCK:
+        value_text = _CFB_STATE.get("last_final_window_value")
+        window_size = _CFB_STATE.get("last_final_window_size")
+        source_ms = _CFB_STATE.get("last_final_window_source_time_ms")
+
+    if window_size != 60 or not value_text or source_ms in (None, ""):
+        return None, None
+
+    try:
+        source_dt = dt.datetime.fromtimestamp(float(source_ms) / 1000.0, dt.timezone.utc)
+    except Exception:
+        return None, None
+
+    # Kalshi documents the size=60 tick as the quarter-hour close tick.
+    # Require it to match the exact prepared session close; never reuse a stale tick.
+    if abs((source_dt - boundary_dt).total_seconds()) > 0.001:
+        return None, source_dt
+
+    return decimal_or_none(value_text), source_dt
+
+
+def capture_prepared_from_cfb_if_due(prepared):
+    """Use Kalshi's authenticated BRTI final 60-second average as the boundary close.
+
+    Returns (captured, prepared_after). This is the live trading trigger path.
+    It never substitutes a stale BRTI tick or the delayed next-session strike.
+    """
+    if not prepared or not CFBENCHMARKS_TRADING_TRIGGER_ENABLED:
+        return False, prepared
+
+    target = prepared.get("close_time")
+    if target is None:
+        return False, prepared
+
+    seconds_left = (target - utc_now()).total_seconds()
+    if seconds_left > WAKE_BEFORE_BOUNDARY_SECONDS:
+        return False, prepared
+
+    if seconds_left > 0:
+        print(
+            f"CFB BOUNDARY ARMED: {prepared.get('ticker','?')} "
+            f"closing in {seconds_left:.3f}s",
+            flush=True,
+        )
+        time.sleep(seconds_left)
+
+    # The upstream source timestamp is exactly the close, but network delivery
+    # can arrive a fraction of a second later. Wait briefly for size=60.
+    deadline = time.monotonic() + max(0.25, CFBENCHMARKS_FINAL_WAIT_SECONDS)
+    stale_seen = None
+    while time.monotonic() <= deadline:
+        final_value, source_dt = cfb_final_value_for_boundary(target)
+        if final_value is not None:
+            now = utc_now()
+            lag = (now - target).total_seconds()
+            start_btc = prepared.get("start_btc")
+            if start_btc is None:
+                print(
+                    f"CFB BOUNDARY FLAGGED: {prepared.get('ticker','?')} "
+                    "Kalshi Target Price unavailable before close.",
+                    flush=True,
+                )
+                return False, None
+
+            distance = final_value - start_btc
+            result = "yes" if distance > 0 else "no" if distance < 0 else "tie"
+            print(
+                "*** CFB TRADING RESULT READY *** | "
+                f"ticker={prepared.get('ticker','?')} "
+                f"start={format_decimal(start_btc)} "
+                f"final_avg={format_decimal(final_value)} "
+                f"distance={format_decimal(distance)} result={result.upper()} "
+                f"receive_lag={lag:+.3f}s",
+                flush=True,
+            )
+
+            market = prepared.get("market") or {}
+            appended = append_session_result(
+                market,
+                start_btc,
+                final_value,
+                "kalshi_cfbenchmarks_brti_15m_final",
+                "cfbenchmarks_value.last_60s_windowed_average_15min",
+                "BRTI",
+                lag,
+                note=(
+                    f"start_source={prepared.get('start_source','')}; "
+                    "cfbenchmarks_index=BRTI; window_size=60; "
+                    f"source_time={source_dt.isoformat() if source_dt else ''}; "
+                    "trading_trigger=true"
+                ),
+            )
+            # If already persisted for some reason, still clear prepared; the exact
+            # boundary row can be read back by latest_fast_boundary_row().
+            return True if appended or latest_fast_boundary_row(target) else False, None
+
+        if source_dt is not None:
+            stale_seen = source_dt
+        time.sleep(max(0.005, CFBENCHMARKS_FINAL_POLL_SECONDS))
+
+    lag = (utc_now() - target).total_seconds()
+    print(
+        "CFB BOUNDARY TIMEOUT: "
+        f"ticker={prepared.get('ticker','?')} target={target.isoformat()} "
+        f"waited={CFBENCHMARKS_FINAL_WAIT_SECONDS:g}s lag={lag:+.3f}s "
+        f"last_stale_source={stale_seen.isoformat() if stale_seen else 'none'}; "
+        "NO FAST TRADE",
+        flush=True,
+    )
+    return False, None
+
 def cfbenchmarks_thread_worker():
     try:
         asyncio.run(cfbenchmarks_diagnostic_loop())
@@ -3155,6 +3286,7 @@ def main():
     ensure_trade_log()
     ensure_session_log()
     start_cfbenchmarks_diagnostic_thread()
+    print(f"CFBENCHMARKS TRADING TRIGGER={'ON' if CFBENCHMARKS_TRADING_TRIGGER_ENABLED else 'OFF'} final_wait={CFBENCHMARKS_FINAL_WAIT_SECONDS:g}s", flush=True)
 
     print("KALSHI BTC 15-MINUTE STREAK BOT")
     if MODE == "paper":
@@ -3185,8 +3317,8 @@ def main():
             f"window={slot['entry_window_minutes']:g}m "
             f"contracts={slot['contracts']:g}"
         )
-    print("OUTCOME METHOD=instant Kalshi boundary BTC for live decision; successive strikes retained for history/diagnostics")
-    print("FAST BOUNDARY=ON; no wait for next formal strike when Kalshi live BTC capture is available")
+    print("OUTCOME METHOD=Kalshi CF Benchmarks BRTI final 60-second quarter-hour average; successive strikes retained for verification")
+    print("FAST BOUNDARY=ON; BRTI window_size=60 is the live trigger; no wait for next formal strike")
     print("SESSION CLOCK=close_time - 15 minutes")
     print("FUTURE STRIKE GUARD=enabled; future sessions excluded")
     print("OFFICIAL RESULT=not used")
@@ -3286,7 +3418,7 @@ def main():
                                 utc_now().timestamp() + LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS
                             )
 
-                    captured, prepared_fast_session = capture_prepared_if_due(
+                    captured, prepared_fast_session = capture_prepared_from_cfb_if_due(
                         prepared_fast_session
                     )
                     if captured:
@@ -3298,6 +3430,7 @@ def main():
                                 "FAST_PRICE_CAPTURE",
                                 boundary_dt=boundary_dt,
                                 detail=(
+                                    f"source={row.get('close_price_source','?')} "
                                     f"start={row.get('kalshi_start_btc','?')} "
                                     f"close={row.get('kalshi_close_btc','?')} "
                                     f"result={row.get('immediate_result','?')} "
