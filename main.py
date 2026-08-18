@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_V10_2026-08-17"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_V11_2026-08-18"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -130,6 +130,17 @@ def env_bool(name, default=False):
 TIME_EXIT_ENABLED = env_bool("TIME_EXIT_ENABLED", True)
 
 EXIT_LOGGING_ENABLED = env_bool("EXIT_LOGGING_ENABLED", True)
+
+# S2 price-movement quality filter. Historical analysis favored requiring the
+# two-session streak to travel at least $30 per 15-minute session on average
+# ($60 total across the two-session streak). Fail closed if the required
+# Kalshi BTC prices are unavailable.
+S2_MOVE_FILTER_ENABLED = env_bool("S2_MOVE_FILTER_ENABLED", True)
+S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS = Decimal(
+    os.getenv("S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS", "30")
+)
+if S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS < 0:
+    raise RuntimeError("S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS must be >= 0")
 
 STRATEGY_SLOTS = [
     {
@@ -1539,6 +1550,41 @@ def calculate_streak(markets):
     return latest, count
 
 
+def s2_move_filter(markets, streak):
+    """Return (passes, detail) for the S2 $30/session movement filter.
+
+    The measurement is the absolute BTC move from the Kalshi start price of
+    the first session in the 2-streak to the Kalshi boundary close price of
+    the second session. Thus $30/session means a $60 minimum total move.
+    Other streak lengths pass unchanged.
+    """
+    if not S2_MOVE_FILTER_ENABLED or streak != 2:
+        return True, "not_applicable"
+
+    if len(markets) < 2:
+        return False, "insufficient_session_history"
+
+    streak_markets = markets[-2:]
+    latest_result = (streak_markets[-1].get("result") or "").lower()
+    if latest_result not in {"yes", "no"}:
+        return False, "latest_result_not_directional"
+    if any((m.get("result") or "").lower() != latest_result for m in streak_markets):
+        return False, "last_two_not_same_direction"
+
+    streak_start = decimal_or_none(streak_markets[0].get("kalshi_start_btc"))
+    streak_close = decimal_or_none(streak_markets[-1].get("kalshi_close_btc"))
+    if streak_start is None or streak_close is None:
+        return False, "missing_kalshi_btc_price"
+
+    total_move = abs(streak_close - streak_start)
+    avg_move = total_move / Decimal("2")
+    passes = avg_move >= S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS
+    detail = (
+        f"total_move=${format_decimal(total_move, 2)} "
+        f"avg_per_session=${format_decimal(avg_move, 2)} "
+        f"minimum=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS, 2)}"
+    )
+    return passes, detail
 
 
 PERFORMANCE_FIELDS = [
@@ -3317,6 +3363,11 @@ def main():
             f"window={slot['entry_window_minutes']:g}m "
             f"contracts={slot['contracts']:g}"
         )
+    print(
+        f"S2 MOVE FILTER={'ON' if S2_MOVE_FILTER_ENABLED else 'OFF'} "
+        f"minimum_avg_per_session=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS, 2)} "
+        f"minimum_total_for_S2=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS * Decimal('2'), 2)}"
+    )
     print("OUTCOME METHOD=Kalshi CF Benchmarks BRTI final 60-second quarter-hour average; successive strikes retained for verification")
     print("FAST BOUNDARY=ON; BRTI window_size=60 is the live trigger; no wait for next formal strike")
     print("SESSION CLOCK=close_time - 15 minutes")
@@ -3526,9 +3577,19 @@ def main():
                         f"latest_derived_close={latest_close}; no new entry yet."
                     )
                 elif last_result in {"yes", "no"}:
-                    matches = strategies_for_streak(streak)
+                    s2_ok, s2_detail = s2_move_filter(immediate_markets, streak)
+                    if not s2_ok:
+                        print(
+                            f"S2 MOVE FILTER SKIP (PAPER): streak={streak} {s2_detail}; "
+                            "no paper order."
+                        )
+                        matches = []
+                    else:
+                        if streak == 2 and S2_MOVE_FILTER_ENABLED:
+                            print(f"S2 MOVE FILTER PASS (PAPER): {s2_detail}")
+                        matches = strategies_for_streak(streak)
                     if not matches:
-                        print(f"NO SLOT MATCH: streak={streak}; no paper orders.")
+                        print(f"NO SLOT MATCH/FILTERED: streak={streak}; no paper orders.")
                     else:
                         open_markets = get_open_markets()
                         for strategy in matches:
@@ -3977,6 +4038,26 @@ def main():
             if last_result not in {"yes", "no"}:
                 sleep_idle()
                 continue
+
+            s2_ok, s2_detail = s2_move_filter(decision_markets, streak)
+            if not s2_ok:
+                print(
+                    f"S2 MOVE FILTER SKIP: streak={streak} {s2_detail}; no live order."
+                )
+                latency_mark(
+                    "S2_MOVE_FILTER_SKIP",
+                    boundary_dt=target_start,
+                    detail=s2_detail,
+                )
+                sleep_idle()
+                continue
+            if streak == 2 and S2_MOVE_FILTER_ENABLED:
+                print(f"S2 MOVE FILTER PASS: {s2_detail}")
+                latency_mark(
+                    "S2_MOVE_FILTER_PASS",
+                    boundary_dt=target_start,
+                    detail=s2_detail,
+                )
 
             strategy = strategy_for_streak(streak)
             if strategy is None:
