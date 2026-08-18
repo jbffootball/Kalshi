@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_V13_2026-08-18"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OIDIAG_V14_2026-08-18"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -89,6 +89,17 @@ S2_SELL_EARLY_CENTS = float(os.getenv("S2_SELL_EARLY_CENTS", "100"))
 S3_SELL_EARLY_CENTS = float(os.getenv("S3_SELL_EARLY_CENTS", "96"))
 S4_SELL_EARLY_CENTS = float(os.getenv("S4_SELL_EARLY_CENTS", "96"))
 S5_SELL_EARLY_CENTS = float(os.getenv("S5_SELL_EARLY_CENTS", "96"))
+
+# S2 current-market open-interest diagnostic. Diagnostic only: never blocks, delays,
+# cancels, or modifies an order. It records the earliest Kalshi market_ticker OI
+# updates after the new 15-minute market begins so we can determine whether an OI
+# filter is observable within ~1 second.
+OI_DIAGNOSTIC_ENABLED = os.getenv("OI_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OI_DIAGNOSTIC_LOOKBACK_MARKETS = int(os.getenv("OI_DIAGNOSTIC_LOOKBACK_MARKETS", "12"))
+OI_DIAGNOSTIC_MAX_SECONDS = float(os.getenv("OI_DIAGNOSTIC_MAX_SECONDS", "65"))
+OI_DIAGNOSTIC_REST_PROBE_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_SECONDS", "2"))
+OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS", "0.25"))
+OI_DIAGNOSTIC_LOG = os.getenv("OI_DIAGNOSTIC_LOG", "/data/s2_oi_diagnostic.csv")
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
 
 EXIT_LOG_POLL_SECONDS = float(os.getenv("EXIT_LOG_POLL_SECONDS", "1"))
@@ -3011,6 +3022,274 @@ def monitor_position_once(position):
 
 
 # -----------------------------------------------------------------------------
+# S2 CURRENT-MARKET OPEN-INTEREST DIAGNOSTIC -- NO TRADING-RULE CHANGES
+# -----------------------------------------------------------------------------
+_OI_WATCH_LOCK = threading.Lock()
+_OI_WATCHED_TICKERS = set()
+_OI_BASELINES = {}
+_OI_FIELDS = [
+    "target_start_utc", "ticker", "received_time_utc", "elapsed_seconds",
+    "source_time_utc", "open_interest_fp", "volume_fp", "price_dollars",
+    "yes_bid_dollars", "yes_ask_dollars", "baseline_12_final_oi_median",
+    "oi_ratio_to_baseline", "event",
+]
+
+
+def _oi_decimal(value):
+    try:
+        if value in (None, ""):
+            return None
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _market_oi(market):
+    return _oi_decimal(market.get("open_interest_fp", market.get("open_interest")))
+
+
+def _median_decimal(values):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    if n % 2:
+        return vals[n // 2]
+    return (vals[n // 2 - 1] + vals[n // 2]) / Decimal("2")
+
+
+def _ensure_oi_log():
+    p = Path(OI_DIAGNOSTIC_LOG)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists() or p.stat().st_size == 0:
+        with p.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_OI_FIELDS).writeheader()
+
+
+def _append_oi_log(row):
+    try:
+        _ensure_oi_log()
+        with Path(OI_DIAGNOSTIC_LOG).open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=_OI_FIELDS).writerow({k: row.get(k, "") for k in _OI_FIELDS})
+    except Exception as exc:
+        print(f"OI DIAGNOSTIC LOG WARNING: {exc!r}", flush=True)
+
+
+def _trailing_final_oi_baseline(target_start, exclude_ticker=None):
+    """Best-effort trailing final-OI median for completed markets before target_start.
+
+    This baseline is diagnostic only. We use market-level OI from completed/closed
+    market objects and keep it separate from the real-time current-market OI stream.
+    """
+    try:
+        data = get_json("/markets", {"series_ticker": SERIES, "limit": 1000})
+        candidates = []
+        for m in data.get("markets", []):
+            if exclude_ticker and m.get("ticker") == exclude_ticker:
+                continue
+            close_dt = parse_time(m.get("close_time"))
+            if close_dt is None or close_dt > target_start:
+                continue
+            oi = _market_oi(m)
+            if oi is None:
+                continue
+            candidates.append((close_dt, m.get("ticker") or "", oi))
+        candidates.sort(key=lambda x: x[0])
+        tail = candidates[-max(1, OI_DIAGNOSTIC_LOOKBACK_MARKETS):]
+        med = _median_decimal([x[2] for x in tail])
+        return med, tail
+    except Exception as exc:
+        print(f"OI BASELINE WARNING: {exc!r}", flush=True)
+        return None, []
+
+
+def _oi_baseline_worker(ticker, target_start):
+    med, tail = _trailing_final_oi_baseline(target_start, exclude_ticker=ticker)
+    with _OI_WATCH_LOCK:
+        _OI_BASELINES[ticker] = med
+    if med is None:
+        print(
+            f"OI BASELINE UNAVAILABLE: ticker={ticker} target_start={target_start.isoformat()}",
+            flush=True,
+        )
+        return
+    print(
+        f"OI BASELINE READY: ticker={ticker} lookback={len(tail)} "
+        f"median_final_oi={med} target_start={target_start.isoformat()}",
+        flush=True,
+    )
+
+
+async def _oi_market_ticker_loop(ticker, target_start):
+    ws_url = cfbenchmarks_ws_url()
+    headers = websocket_auth_headers()
+    first_update = True
+    deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_MAX_SECONDS)
+    print(f"OI WS CONNECTING: ticker={ticker}", flush=True)
+    async with websockets.connect(
+        ws_url,
+        additional_headers=headers,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=5,
+    ) as ws:
+        sub = {
+            "id": 8101,
+            "cmd": "subscribe",
+            "params": {"channels": ["market_ticker"], "market_ticker": ticker},
+        }
+        await ws.send(json.dumps(sub))
+        print(f"OI WS SUBSCRIBE SENT: ticker={ticker} channel=market_ticker", flush=True)
+        while utc_now() <= deadline:
+            timeout = max(0.05, min(2.0, (deadline - utc_now()).total_seconds()))
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except asyncio.TimeoutError:
+                continue
+            data = json.loads(raw)
+            if data.get("type") == "subscribed":
+                print(f"OI WS SUBSCRIBED: ticker={ticker} {json.dumps(data, sort_keys=True)}", flush=True)
+                continue
+            if data.get("type") == "error":
+                print(f"OI WS ERROR: ticker={ticker} {json.dumps(data, sort_keys=True)}", flush=True)
+                continue
+            if data.get("type") != "ticker":
+                continue
+            msg = data.get("msg") or {}
+            if msg.get("market_ticker") != ticker:
+                continue
+            received = utc_now()
+            elapsed = (received - target_start).total_seconds()
+            oi = _oi_decimal(msg.get("open_interest_fp"))
+            vol = _oi_decimal(msg.get("volume_fp"))
+            with _OI_WATCH_LOCK:
+                baseline = _OI_BASELINES.get(ticker)
+            ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
+            source_time = msg.get("time") or (str(msg.get("ts_ms")) if msg.get("ts_ms") is not None else "")
+            event = "FIRST_UPDATE" if first_update else "UPDATE"
+            _append_oi_log({
+                "target_start_utc": target_start.isoformat(),
+                "ticker": ticker,
+                "received_time_utc": received.isoformat(),
+                "elapsed_seconds": f"{elapsed:.3f}",
+                "source_time_utc": source_time,
+                "open_interest_fp": str(oi) if oi is not None else "",
+                "volume_fp": str(vol) if vol is not None else "",
+                "price_dollars": msg.get("price_dollars", ""),
+                "yes_bid_dollars": msg.get("yes_bid_dollars", ""),
+                "yes_ask_dollars": msg.get("yes_ask_dollars", ""),
+                "baseline_12_final_oi_median": str(baseline) if baseline is not None else "",
+                "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
+                "event": event,
+            })
+            if first_update or elapsed <= 2.0 or (int(max(0, elapsed)) in {5, 10, 15, 30, 60}):
+                print(
+                    f"OI {event}: ticker={ticker} t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
+                    f"volume={vol if vol is not None else '?'} baseline12={baseline if baseline is not None else '?'} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'}",
+                    flush=True,
+                )
+            first_update = False
+    print(f"OI WS COMPLETE: ticker={ticker} window={OI_DIAGNOSTIC_MAX_SECONDS:g}s", flush=True)
+
+
+def _oi_ws_worker(ticker, target_start):
+    try:
+        asyncio.run(_oi_market_ticker_loop(ticker, target_start))
+    except Exception as exc:
+        print(f"OI WS FATAL: ticker={ticker} {exc!r}", flush=True)
+
+
+def _oi_fast_rest_probe_worker(ticker, target_start):
+    """Non-blocking fast REST snapshots for the first ~2 seconds.
+
+    This is intentionally independent of order submission. It tells us the earliest
+    elapsed time at which Kalshi's REST market object exposes current-market OI.
+    """
+    deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_REST_PROBE_SECONDS)
+    attempt = 0
+    first_ok = True
+    while utc_now() <= deadline:
+        attempt += 1
+        try:
+            market = get_market_by_ticker(ticker)
+            received = utc_now()
+            elapsed = (received - target_start).total_seconds()
+            oi = _market_oi(market)
+            vol = _oi_decimal(market.get("volume_fp", market.get("volume")))
+            with _OI_WATCH_LOCK:
+                baseline = _OI_BASELINES.get(ticker)
+            ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
+            _append_oi_log({
+                "target_start_utc": target_start.isoformat(),
+                "ticker": ticker,
+                "received_time_utc": received.isoformat(),
+                "elapsed_seconds": f"{elapsed:.3f}",
+                "source_time_utc": market.get("updated_time", ""),
+                "open_interest_fp": str(oi) if oi is not None else "",
+                "volume_fp": str(vol) if vol is not None else "",
+                "price_dollars": market.get("last_price_dollars", market.get("last_price", "")),
+                "yes_bid_dollars": market.get("yes_bid_dollars", ""),
+                "yes_ask_dollars": market.get("yes_ask_dollars", ""),
+                "baseline_12_final_oi_median": str(baseline) if baseline is not None else "",
+                "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
+                "event": "REST_FIRST" if first_ok else "REST_PROBE",
+            })
+            if first_ok or elapsed <= 1.1:
+                print(
+                    f"OI REST {'FIRST' if first_ok else 'PROBE'}: ticker={ticker} "
+                    f"attempt={attempt} t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
+                    f"baseline12={baseline if baseline is not None else '?'} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'}",
+                    flush=True,
+                )
+            first_ok = False
+        except Exception as exc:
+            elapsed = (utc_now() - target_start).total_seconds()
+            if attempt <= 3:
+                print(
+                    f"OI REST NOT READY: ticker={ticker} attempt={attempt} "
+                    f"t={elapsed:+.3f}s error={exc!r}",
+                    flush=True,
+                )
+        time.sleep(max(0.05, OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS))
+
+
+def start_s2_oi_diagnostic(ticker, target_start, trigger_streak):
+    """Start non-blocking S2 OI collection once per market ticker."""
+    if not OI_DIAGNOSTIC_ENABLED or int(trigger_streak) != 2 or not ticker:
+        return
+    with _OI_WATCH_LOCK:
+        if ticker in _OI_WATCHED_TICKERS:
+            return
+        _OI_WATCHED_TICKERS.add(ticker)
+    print(
+        f"OI DIAGNOSTIC START: ticker={ticker} streak={trigger_streak} "
+        f"lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} max_seconds={OI_DIAGNOSTIC_MAX_SECONDS:g} "
+        "TRADING_RULES_UNCHANGED",
+        flush=True,
+    )
+    threading.Thread(
+        target=_oi_baseline_worker,
+        args=(ticker, target_start),
+        daemon=True,
+        name=f"oi-baseline-{ticker}",
+    ).start()
+    threading.Thread(
+        target=_oi_ws_worker,
+        args=(ticker, target_start),
+        daemon=True,
+        name=f"oi-ws-{ticker}",
+    ).start()
+    threading.Thread(
+        target=_oi_fast_rest_probe_worker,
+        args=(ticker, target_start),
+        daemon=True,
+        name=f"oi-rest-{ticker}",
+    ).start()
+
+
+# -----------------------------------------------------------------------------
 # CF BENCHMARKS BRTI WEBSOCKET DIAGNOSTIC -- NO TRADING-RULE CHANGES
 # -----------------------------------------------------------------------------
 _CFB_STATE_LOCK = threading.Lock()
@@ -3354,6 +3633,14 @@ def main():
         f"EXITS CONFIG: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
         f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
         "(100c=HOLD) STOP_LOSS=OFF",
+        flush=True,
+    )
+    print(
+        f"OI DIAGNOSTIC={'ON' if OI_DIAGNOSTIC_ENABLED else 'OFF'} "
+        f"streak=S2 lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} "
+        f"window={OI_DIAGNOSTIC_MAX_SECONDS:g}s fast_rest={OI_DIAGNOSTIC_REST_PROBE_SECONDS:g}s "
+        f"log={OI_DIAGNOSTIC_LOG} "
+        "TRADING_RULES_UNCHANGED",
         flush=True,
     )
 
@@ -3937,6 +4224,11 @@ def main():
                         continue
 
                     ticker = market["ticker"]
+                    start_s2_oi_diagnostic(
+                        ticker,
+                        pending_api_signal["target_start"],
+                        pending_api_signal["trigger_streak"],
+                    )
                     age = market_age_minutes(market)
                     latency_mark(
                         "MARKET_VISIBLE",
@@ -4136,6 +4428,13 @@ def main():
                     else None
                 ),
             }
+            if pending_api_signal.get("ticker_hint"):
+                start_s2_oi_diagnostic(
+                    pending_api_signal["ticker_hint"],
+                    pending_api_signal["target_start"],
+                    pending_api_signal["trigger_streak"],
+                )
+
             latency_mark(
                 "SIGNAL_LOCKED",
                 boundary_dt=target_start,
