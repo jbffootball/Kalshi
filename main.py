@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_V11_2026-08-18"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_V13_2026-08-18"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -85,6 +85,10 @@ CFBENCHMARKS_FINAL_WAIT_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_WAIT_SECON
 CFBENCHMARKS_FINAL_POLL_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_POLL_SECONDS", "0.01"))
 STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
 SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
+S2_SELL_EARLY_CENTS = float(os.getenv("S2_SELL_EARLY_CENTS", "100"))
+S3_SELL_EARLY_CENTS = float(os.getenv("S3_SELL_EARLY_CENTS", "96"))
+S4_SELL_EARLY_CENTS = float(os.getenv("S4_SELL_EARLY_CENTS", "96"))
+S5_SELL_EARLY_CENTS = float(os.getenv("S5_SELL_EARLY_CENTS", "96"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
 
 EXIT_LOG_POLL_SECONDS = float(os.getenv("EXIT_LOG_POLL_SECONDS", "1"))
@@ -2872,6 +2876,36 @@ def submit_exit_ioc(ticker, held_side, contracts, side_bid):
     return resp.get("order", resp)
 
 
+def strategy_exit_settings(position):
+    """
+    Simple streak-specific live exit rule:
+      S2: hold to settlement (no early sell, no stop loss)
+      S3/S4/S5: sell early at 96c if an executable bid reaches 96c
+    No universal stop loss is used for these strategies.
+    """
+    try:
+        streak = int(position.get("trigger_streak", 0))
+    except (TypeError, ValueError):
+        streak = 0
+
+    targets = {
+        2: S2_SELL_EARLY_CENTS,
+        3: S3_SELL_EARLY_CENTS,
+        4: S4_SELL_EARLY_CENTS,
+        5: S5_SELL_EARLY_CENTS,
+    }
+    early_target = float(targets.get(streak, 100.0))
+    if not 1 <= early_target <= 100:
+        early_target = 100.0
+    label = f"S{streak}_hold" if early_target >= 100 else f"S{streak}_take{early_target:g}"
+    return 0.0, early_target, label
+
+
+def position_exit_monitor_needed(position):
+    stop_threshold, early_threshold, _ = strategy_exit_settings(position)
+    return stop_threshold > 0 or early_threshold < 100
+
+
 def monitor_position_once(position):
     """
     Check one filled position against the Railway-configured stop-loss and
@@ -2903,30 +2937,13 @@ def monitor_position_once(position):
 
     entry = float(position["entry_cents"])
 
-    if TIME_EXIT_ENABLED:
-        stop_threshold, early_threshold, minutes_remaining, time_band = (
-            time_exit_thresholds(market)
-        )
-        stop_hit = (
-            stop_threshold is not None
-            and stop_threshold > 0
-            and bid <= stop_threshold
-        )
-        early_hit = (
-            early_threshold is not None
-            and early_threshold < 100
-            and bid >= early_threshold
-        )
-    else:
-        stop_threshold = STOP_LOSS_CENTS
-        early_threshold = SELL_EARLY_CENTS
-        minutes_remaining = (
-            (close_dt - utc_now()).total_seconds() / 60.0
-            if close_dt is not None else None
-        )
-        time_band = "fixed"
-        stop_hit = STOP_LOSS_CENTS > 0 and bid <= STOP_LOSS_CENTS
-        early_hit = SELL_EARLY_CENTS < 100 and bid >= SELL_EARLY_CENTS
+    stop_threshold, early_threshold, time_band = strategy_exit_settings(position)
+    minutes_remaining = (
+        (close_dt - utc_now()).total_seconds() / 60.0
+        if close_dt is not None else None
+    )
+    stop_hit = stop_threshold > 0 and bid <= stop_threshold
+    early_hit = early_threshold < 100 and bid >= early_threshold
 
     remaining_text = (
         f"{minutes_remaining:.2f}m"
@@ -3333,6 +3350,12 @@ def main():
     ensure_session_log()
     start_cfbenchmarks_diagnostic_thread()
     print(f"CFBENCHMARKS TRADING TRIGGER={'ON' if CFBENCHMARKS_TRADING_TRIGGER_ENABLED else 'OFF'} final_wait={CFBENCHMARKS_FINAL_WAIT_SECONDS:g}s", flush=True)
+    print(
+        f"EXITS CONFIG: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
+        f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
+        "(100c=HOLD) STOP_LOSS=OFF",
+        flush=True,
+    )
 
     print("KALSHI BTC 15-MINUTE STREAK BOT")
     if MODE == "paper":
@@ -3380,10 +3403,8 @@ def main():
         f"boundary_guard={LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS:g}s"
     )
     print(
-        f"EXITS: STOP_LOSS_CENTS={STOP_LOSS_CENTS:g} "
-        f"SELL_EARLY_CENTS={SELL_EARLY_CENTS:g} "
-        f"POSITION_POLL={POLL_POSITION_SECONDS:g}s "
-        "(STOP=0 disables stop; EARLY=100 disables early sell)"
+        "EXITS: S2=HOLD S3=96c S4=96c S5=96c STOP_LOSS=OFF "
+        f"POSITION_POLL={POLL_POSITION_SECONDS:g}s"
     )
     print(f"TRADE LOG={TRADE_LOG}")
     print(f"SESSION LOG={SESSION_LOG}")
@@ -3720,6 +3741,8 @@ def main():
                             "side": side,
                             "entry_cents": fill_cents,
                             "contracts": filled,
+                            "trigger_streak": current_order["trigger_streak"],
+                            "slot": current_order.get("slot", ""),
                         }
                         start_exit_logging(
                             ticker,
@@ -3729,7 +3752,7 @@ def main():
                             filled,
                         )
                         current_order = None
-                        if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                        if position_exit_monitor_needed(current_position):
                             print(
                                 f"PAPER POSITION MONITOR STARTED: {ticker} {side.upper()} "
                                 f"qty={filled:g} entry={fill_cents:.1f}c"
@@ -3789,6 +3812,8 @@ def main():
                         "side": side,
                         "entry_cents": fill_cents,
                         "contracts": filled,
+                        "trigger_streak": current_order["trigger_streak"],
+                        "slot": current_order.get("slot", ""),
                     }
                     start_exit_logging(
                         ticker,
@@ -3798,7 +3823,7 @@ def main():
                         filled,
                     )
                     current_order = None
-                    if TIME_EXIT_ENABLED or STOP_LOSS_CENTS > 0 or SELL_EARLY_CENTS < 100:
+                    if position_exit_monitor_needed(current_position):
                         print(
                             f"POSITION MONITOR STARTED: {ticker} {side.upper()} "
                             f"qty={filled:g} entry={fill_cents:.1f}c"
