@@ -1,716 +1,501 @@
 #!/usr/bin/env python3
 """
-Kalshi KXBTC15M 10,000-market non-overlapping validation backtest.
+download_eth15m_kalshi_v2.py
 
-Purpose
--------
-Pull the 10,000 KXBTC15M markets immediately BEFORE the most-recent
-5,000-market discovery block and evaluate the full practical entry grid.
+Robust downloader for up to 15,000 completed Kalshi ETH 15-minute markets
+(KXETH15M) plus 1-minute candlesticks.
 
-Kalshi-only public data. No external BTC source. No trading.
+Designed for Railway:
+- short candle request timeouts
+- max 2 candle attempts per endpoint
+- skips bad/slow markets instead of hanging
+- progress every 25 markets
+- checkpoint/resume support
+- records skipped candle markets
+- uses Kalshi's current documented live candlestick endpoint
+- uses historical/archive endpoint for archived markets
 
-Outcome rule
-------------
-Successive Kalshi strikes define each completed 15-minute session:
-    next strike > current strike  -> YES
-    next strike < current strike  -> NO
-    equal                         -> TIE
+Outputs under ./eth_data:
+  eth_15m_sessions_15k.csv
+  eth_15m_candles_15k.csv
+  eth_15m_market_raw_15k.jsonl
+  eth_15m_checkpoint.jsonl
+  eth_15m_candle_failures.csv
+  eth_15m_download_report.txt
 
-Reversal trade
---------------
-If the prior completed session/streak ended YES, test buying NO.
-If it ended NO, test buying YES.
-
-Grid
-----
-Streaks: 2, 3, 4, 5
-Entry limits: 20c through 60c
-Entry windows: 2 through 6 minutes
-Exit: hold to close
-Stop: OFF
-Sell early: OFF
-
-Outputs
--------
-/data/kalshi_validation_10000/
-    sessions_with_streaks.csv
-    candles_1min.csv                  # appended incrementally; survives restart
-    candle_progress.csv                 # one row per processed market
-    grid_results.csv
-    grid_ranked_by_avg_pnl.csv
-    grid_ranked_min100_trades.csv
-    grid_ranked_min250_trades.csv
-    daily_trade_results.csv
-    monthly_strategy_summary.csv
-    run_summary.json
+Run:
+  python download_eth15m_kalshi_v2.py
 """
 
+import argparse
 import csv
 import json
 import math
-import os
+import re
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
-SERIES = os.getenv("SERIES_TICKER", "KXBTC15M")
+SERIES = "KXETH15M"
+DEFAULT_MAX_MARKETS = 15000
+LIST_TIMEOUT = 20
+LIST_RETRIES = 5
+CANDLE_TIMEOUT = 8
+CANDLE_ATTEMPTS_PER_ENDPOINT = 2
+PROGRESS_EVERY = 25
+REQUEST_PAUSE = 0.02
 
-# IMPORTANT: skip the newest 5,000-market discovery block, then take 10,000 older markets.
-MARKET_OFFSET = int(os.getenv("MARKET_OFFSET", "5000"))
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "10000"))
 
-MIN_STREAK = int(os.getenv("MIN_STREAK", "2"))
-MAX_STREAK = int(os.getenv("MAX_STREAK", "5"))
-MIN_ENTRY_CENTS = int(os.getenv("MIN_ENTRY_CENTS", "20"))
-MAX_ENTRY_CENTS = int(os.getenv("MAX_ENTRY_CENTS", "60"))
-MIN_WINDOW_MIN = int(os.getenv("MIN_WINDOW_MIN", "2"))
-MAX_WINDOW_MIN = int(os.getenv("MAX_WINDOW_MIN", "6"))
+def iso_to_dt(x: Any) -> Optional[datetime]:
+    if not x:
+        return None
+    try:
+        s = str(x).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-OUT_DIR = Path(os.getenv("OUT_DIR", "/data/kalshi_validation_10000"))
-if not OUT_DIR.parent.exists():
-    OUT_DIR = Path("./kalshi_validation_10000")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Progress is written to the Railway volume after every market so an
-# interruption/redeploy can resume instead of restarting candle collection.
-CANDLE_FILE = OUT_DIR / "candles_1min.csv"
-PROGRESS_FILE = OUT_DIR / "candle_progress.csv"
+def safe_float(x: Any) -> Optional[float]:
+    if x is None or x == "":
+        return None
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "kalshi-public-validation/1.0"})
 
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(str(s).replace("Z", "+00:00")).astimezone(timezone.utc)
-
-def get_json(path: str, params: Optional[dict] = None, tries: int = 8) -> dict:
-    url = BASE + path
-    delay = 1.0
-    last = None
-    for _ in range(tries):
+def request_json(session, url, params=None, timeout=10, attempts=2, label=""):
+    last_error = None
+    for attempt in range(1, attempts + 1):
         try:
-            r = SESSION.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-            last = f"{r.status_code}: {r.text[:300]}"
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code in (400, 401, 403, 404):
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code == 429:
+                wait = min(2 * attempt, 6)
+                print(f"  rate limited{(' on ' + label) if label else ''}; waiting {wait}s (attempt {attempt}/{attempts})", flush=True)
+                time.sleep(wait)
+                last_error = RuntimeError("HTTP 429 rate limit")
                 continue
-            raise RuntimeError(f"GET {url} failed: {last}")
-        except requests.RequestException as e:
-            last = repr(e)
-            time.sleep(delay)
-            delay = min(delay * 2, 30)
-    raise RuntimeError(f"GET {url} failed after retries: {last}")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                print(f"  retry {attempt + 1}/{attempts}{(' for ' + label) if label else ''}: {type(e).__name__}", flush=True)
+                time.sleep(0.5)
+    raise RuntimeError(str(last_error))
 
-def fetch_market_pages(path: str) -> List[dict]:
-    out = []
+
+def paginate_markets(session, historical: bool, max_markets: int):
+    path = "/historical/markets" if historical else "/markets"
+    url = BASE + path
     cursor = None
-    while True:
-        params = {"limit": 1000, "series_ticker": SERIES}
+    out = []
+    tier = "historical" if historical else "recent"
+    while len(out) < max_markets:
+        params = {"limit": min(1000, max_markets - len(out)), "series_ticker": SERIES}
         if cursor:
             params["cursor"] = cursor
-        d = get_json(path, params)
-        rows = d.get("markets", [])
-        out.extend(rows)
-        cursor = d.get("cursor")
-        print(f"{path}: {len(out):,} markets", flush=True)
-        if not cursor or not rows:
+        data = request_json(session, url, params=params, timeout=LIST_TIMEOUT, attempts=LIST_RETRIES, label=f"{tier} market list")
+        batch = data.get("markets") or []
+        out.extend(batch)
+        print(f"{tier} markets fetched: {len(out):,}", flush=True)
+        cursor = data.get("cursor")
+        if not cursor or not batch:
             break
-    return out
+    return out[:max_markets]
 
-def fetch_selected_markets() -> List[dict]:
-    by_ticker = {}
-    for m in fetch_market_pages("/historical/markets") + fetch_market_pages("/markets"):
-        t = m.get("ticker")
-        if t:
-            by_ticker[t] = m
 
-    rows = [
-        m for m in by_ticker.values()
-        if m.get("close_time") and m.get("floor_strike") is not None
-    ]
-    rows.sort(key=lambda m: parse_time(m["close_time"]))
-
-    # Need MAX_MARKETS + 1 strike rows so successive strikes can derive outcomes.
-    end = len(rows) - MARKET_OFFSET
-    start = max(0, end - (MAX_MARKETS + 1))
-    selected = rows[start:end]
-
-    if len(selected) < 100:
-        raise RuntimeError(
-            f"Not enough markets after applying offset={MARKET_OFFSET}. "
-            f"Found only {len(selected)} selected strike rows."
-        )
-    return selected
-
-def derive_sessions(markets: List[dict]) -> List[dict]:
-    base = []
-    running_side = None
-    running_len = 0
-
-    for i in range(len(markets) - 1):
-        m, nxt = markets[i], markets[i + 1]
-        strike = float(m["floor_strike"])
-        next_strike = float(nxt["floor_strike"])
-
-        if next_strike > strike:
-            result = "YES"
-        elif next_strike < strike:
-            result = "NO"
-        else:
-            result = "TIE"
-
-        if result == "TIE":
-            running_side = None
-            running_len = 0
-        elif result == running_side:
-            running_len += 1
-        else:
-            running_side = result
-            running_len = 1
-
-        close_dt = parse_time(m["close_time"])
-        start_ts = int(close_dt.timestamp()) - 15 * 60
-
-        base.append({
-            "ticker": m["ticker"],
-            "close_time": m["close_time"],
-            "session_start_ts": start_ts,
-            "session_start_utc": iso(datetime.fromtimestamp(start_ts, tz=timezone.utc)),
-            "strike": strike,
-            "next_strike": next_strike,
-            "result": result,
-            "streak_ending_here": running_len,
-            "streak_side_ending_here": running_side or "",
-        })
-
-    by_ticker = {x["ticker"]: x for x in base}
-    enriched = []
-
-    # Need a prior completed session to know the streak entering the current market.
-    for i in range(1, len(markets) - 1):
-        cur = by_ticker.get(markets[i]["ticker"])
-        prev = by_ticker.get(markets[i - 1]["ticker"])
-        if not cur or not prev:
-            continue
-
-        reversal_side = ""
-        if prev["result"] == "YES":
-            reversal_side = "NO"
-        elif prev["result"] == "NO":
-            reversal_side = "YES"
-
-        enriched.append({
-            **cur,
-            "prior_result": prev["result"],
-            "prior_streak": prev["streak_ending_here"],
-            "prior_streak_side": prev["streak_side_ending_here"],
-            "reversal_side": reversal_side,
-            "actual_reversal": int(
-                prev["result"] in ("YES", "NO")
-                and cur["result"] in ("YES", "NO")
-                and prev["result"] != cur["result"]
-            ),
-        })
-
-    return enriched
-
-def val(d: Optional[dict], key: str) -> Optional[float]:
-    if not isinstance(d, dict):
-        return None
-    for k in (key + "_dollars", key):
-        x = d.get(k)
-        if x is not None:
-            try:
-                return float(x)
-            except (TypeError, ValueError):
-                return None
-    return None
-
-def fetch_candles(ticker: str, start_ts: int, end_ts: int) -> List[dict]:
-    params = {
-        "start_ts": start_ts,
-        "end_ts": end_ts,
-        "period_interval": 1,
-    }
-
-    # Try both public candle locations. One will cover active/recent, the other archived.
-    paths = [
-        f"/series/{SERIES}/markets/{ticker}/candlesticks",
-        f"/historical/markets/{ticker}/candlesticks",
-    ]
-
-    for path in paths:
+def parse_numeric_from_text(text: str):
+    vals = []
+    if not text:
+        return vals
+    for m in re.finditer(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?)", text):
         try:
-            d = get_json(path, params, tries=4)
-            cs = d.get("candlesticks", [])
-            if cs:
-                return cs
+            vals.append(float(m.group(1).replace(",", "")))
         except Exception:
             pass
+    return vals
 
-    print(f"WARNING candles unavailable {ticker}", flush=True)
-    return []
 
-def candle_row(session: dict, c: dict) -> dict:
-    end_ts = int(c["end_period_ts"])
-    minute = int(math.ceil((end_ts - session["session_start_ts"]) / 60.0))
+def infer_target_price(m):
+    preferred = ["strike", "strike_price", "strike_price_dollars", "target_price", "target_price_dollars", "floor_strike", "cap_strike"]
+    for k in preferred:
+        v = safe_float(m.get(k))
+        if v is not None and 100 <= v <= 100000:
+            return v, k
+    custom = m.get("custom_strike")
+    if isinstance(custom, dict):
+        for k, v in custom.items():
+            f = safe_float(v)
+            if f is not None and 100 <= f <= 100000:
+                return f, f"custom_strike.{k}"
+    for field in ["title", "subtitle", "yes_sub_title", "no_sub_title", "rules_primary", "rules_secondary"]:
+        text = str(m.get(field) or "")
+        candidates = [x for x in parse_numeric_from_text(text) if 100 <= x <= 100000]
+        if candidates:
+            return candidates[0], f"text:{field}"
+    return None, ""
 
-    yb = c.get("yes_bid") or {}
-    ya = c.get("yes_ask") or {}
 
-    yes_ask_low = val(ya, "low")
-    yes_ask_close = val(ya, "close")
-    yes_bid_high = val(yb, "high")
-    yes_bid_close = val(yb, "close")
+def infer_settlement_value(m):
+    for k in ["settlement_value_dollars", "expiration_value", "settlement_value"]:
+        v = safe_float(m.get(k))
+        if v is not None:
+            return v, k
+    return None, ""
 
-    if session["reversal_side"] == "YES":
-        rev_ask_low = yes_ask_low
-        rev_ask_close = yes_ask_close
+
+def normalize_result(m, target, close_value):
+    if target is not None and close_value is not None:
+        if close_value > target:
+            return "YES"
+        if close_value < target:
+            return "NO"
+        return "TIE_INVALID"
+    result = str(m.get("result") or "").strip().lower()
+    if result == "yes":
+        return "YES"
+    if result == "no":
+        return "NO"
+    return "TIE_INVALID"
+
+
+def market_end_dt(m):
+    for k in ["close_time", "expiration_time", "expected_expiration_time", "latest_expiration_time"]:
+        dt = iso_to_dt(m.get(k))
+        if dt:
+            return dt
+    return None
+
+
+def market_start_dt(m):
+    end = market_end_dt(m)
+    if end:
+        return end - timedelta(minutes=15)
+    return iso_to_dt(m.get("open_time"))
+
+
+def fetch_candles_one_endpoint(session, ticker, start_ts, end_ts, tier):
+    if tier == "historical":
+        url = BASE + f"/historical/markets/{ticker}/candlesticks"
     else:
-        # NO ask = 1 - YES bid.
-        # Lowest NO ask in candle uses highest YES bid.
-        rev_ask_low = None if yes_bid_high is None else 1.0 - yes_bid_high
-        rev_ask_close = None if yes_bid_close is None else 1.0 - yes_bid_close
+        url = BASE + f"/series/{SERIES}/markets/{ticker}/candlesticks"
+    params = {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 1}
+    data = request_json(session, url, params=params, timeout=CANDLE_TIMEOUT, attempts=CANDLE_ATTEMPTS_PER_ENDPOINT, label=ticker)
+    return data.get("candlesticks") or []
 
-    def cents(x):
-        return None if x is None else round(x * 100.0, 4)
 
-    return {
-        "ticker": session["ticker"],
-        "close_time": session["close_time"],
-        "session_start_utc": session["session_start_utc"],
-        "result": session["result"],
-        "prior_result": session["prior_result"],
-        "prior_streak": session["prior_streak"],
-        "reversal_side": session["reversal_side"],
-        "actual_reversal": session["actual_reversal"],
-        "minute": minute,
-        "candle_end_ts": end_ts,
-        "yes_ask_low_cents": cents(yes_ask_low),
-        "yes_ask_close_cents": cents(yes_ask_close),
-        "yes_bid_high_cents": cents(yes_bid_high),
-        "yes_bid_close_cents": cents(yes_bid_close),
-        "reversal_ask_low_cents": cents(rev_ask_low),
-        "reversal_ask_close_cents": cents(rev_ask_close),
-        "volume": c.get("volume_fp", c.get("volume")),
-        "open_interest": c.get("open_interest_fp", c.get("open_interest")),
-    }
-
-def write_csv(path: Path, rows: List[dict]):
-    if not rows:
-        print(f"No rows for {path.name}")
-        return
-    fields = list(rows[0].keys())
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-
-def append_csv_rows(path: Path, rows: List[dict]):
-    """Append rows immediately, writing the header only for a new file."""
-    if not rows:
-        return
-    new_file = not path.exists() or path.stat().st_size == 0
-    fields = list(rows[0].keys())
-    with path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        if new_file:
-            w.writeheader()
-        w.writerows(rows)
-        f.flush()
+def fetch_candles_with_fallback(session, ticker, start_ts, end_ts, preferred_tier):
+    tiers = [preferred_tier, "recent" if preferred_tier == "historical" else "historical"]
+    errors = []
+    for tier in tiers:
         try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
+            candles = fetch_candles_one_endpoint(session, ticker, start_ts, end_ts, tier)
+            if candles:
+                return candles, tier, ""
+            errors.append(f"{tier}: empty candle response")
+        except Exception as e:
+            errors.append(f"{tier}: {e}")
+    return [], "", " | ".join(errors)
 
 
-def load_existing_candles() -> Tuple[Dict[str, List[dict]], List[dict]]:
-    """Load already checkpointed candle rows from a prior interrupted run."""
-    by_ticker = defaultdict(list)
-    rows = []
-    if not CANDLE_FILE.exists() or CANDLE_FILE.stat().st_size == 0:
-        return dict(by_ticker), rows
-
-    with CANDLE_FILE.open("r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            # Restore numeric fields needed by the grid.
-            for key in (
-                "prior_streak", "actual_reversal", "minute", "candle_end_ts",
-                "yes_ask_low_cents", "yes_ask_close_cents",
-                "yes_bid_high_cents", "yes_bid_close_cents",
-                "reversal_ask_low_cents", "reversal_ask_close_cents",
-            ):
-                if row.get(key) not in (None, ""):
-                    try:
-                        row[key] = float(row[key])
-                    except ValueError:
-                        pass
-            if isinstance(row.get("prior_streak"), float):
-                row["prior_streak"] = int(row["prior_streak"])
-            if isinstance(row.get("actual_reversal"), float):
-                row["actual_reversal"] = int(row["actual_reversal"])
-            if isinstance(row.get("minute"), float):
-                row["minute"] = int(row["minute"])
-            if isinstance(row.get("candle_end_ts"), float):
-                row["candle_end_ts"] = int(row["candle_end_ts"])
-
-            ticker = row.get("ticker")
-            if ticker:
-                by_ticker[ticker].append(row)
-            rows.append(row)
-
-    return dict(by_ticker), rows
+def flatten_price(prefix, obj, row):
+    if not isinstance(obj, dict):
+        return
+    for k in ["open", "high", "low", "close"]:
+        if k in obj:
+            row[f"{prefix}_{k}"] = obj.get(k)
+    for k in ["open_dollars", "high_dollars", "low_dollars", "close_dollars"]:
+        if k in obj:
+            row[f"{prefix}_{k}"] = obj.get(k)
 
 
-def load_processed_tickers() -> set:
-    """Tickers in this file are complete, even if Kalshi returned zero candles."""
+def read_checkpoint(path):
     done = set()
-    if not PROGRESS_FILE.exists() or PROGRESS_FILE.stat().st_size == 0:
+    if not path.exists():
         return done
-    with PROGRESS_FILE.open("r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            ticker = row.get("ticker")
-            if ticker:
-                done.add(ticker)
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+                if rec.get("ticker"):
+                    done.add(rec["ticker"])
+            except Exception:
+                pass
     return done
 
 
-def checkpoint_market(ticker: str, candle_count: int):
-    append_csv_rows(
-        PROGRESS_FILE,
-        [{
-            "ticker": ticker,
-            "candle_count": candle_count,
-            "processed_time_utc": iso(datetime.now(timezone.utc)),
-        }],
-    )
+def append_checkpoint(path, ticker, status, rows, error=""):
+    rec = {"ticker": ticker, "status": status, "candle_rows": rows, "error": error, "time_utc": datetime.now(timezone.utc).isoformat()}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
 
-
-def run_grid(
-    sessions: List[dict],
-    candles_by_ticker: Dict[str, List[dict]]
-) -> Tuple[List[dict], List[dict]]:
-    grid = []
-    trade_details = []
-
-    eligible = [
-        s for s in sessions
-        if MIN_STREAK <= s["prior_streak"] <= MAX_STREAK
-        and s["reversal_side"]
-    ]
-    print(
-        f"Eligible streak {MIN_STREAK}-{MAX_STREAK} markets: {len(eligible):,}",
-        flush=True
-    )
-
-    usable = {}
-    for s in eligible:
-        rows = [
-            r for r in candles_by_ticker.get(s["ticker"], [])
-            if 1 <= r["minute"] <= 15
-            and r["reversal_ask_low_cents"] is not None
-        ]
-        rows.sort(key=lambda r: (r["minute"], r["candle_end_ts"]))
-        usable[s["ticker"]] = rows
-
-    for streak in range(MIN_STREAK, MAX_STREAK + 1):
-        ss = [s for s in eligible if s["prior_streak"] == streak]
-
-        for entry in range(MIN_ENTRY_CENTS, MAX_ENTRY_CENTS + 1):
-            for window in range(MIN_WINDOW_MIN, MAX_WINDOW_MIN + 1):
-                n = wins = losses = 0
-                pnl = 0.0
-
-                for s in ss:
-                    touch = None
-                    for r in usable.get(s["ticker"], []):
-                        if r["minute"] > window:
-                            break
-                        if r["reversal_ask_low_cents"] <= entry:
-                            touch = r
-                            break
-
-                    if touch is None:
-                        continue
-
-                    win = bool(s["actual_reversal"])
-                    trade_pnl = (100 - entry) if win else -entry
-
-                    n += 1
-                    wins += int(win)
-                    losses += int(not win)
-                    pnl += trade_pnl
-
-                    trade_details.append({
-                        "streak": streak,
-                        "entry_cents": entry,
-                        "window_minutes": window,
-                        "ticker": s["ticker"],
-                        "session_start_utc": s["session_start_utc"],
-                        "date_utc": s["session_start_utc"][:10],
-                        "month_utc": s["session_start_utc"][:7],
-                        "prior_result": s["prior_result"],
-                        "reversal_side": s["reversal_side"],
-                        "entry_touch_minute": touch["minute"],
-                        "actual_reversal": int(win),
-                        "pnl_cents": trade_pnl,
-                    })
-
-                grid.append({
-                    "streak": streak,
-                    "entry_cents": entry,
-                    "window_minutes": window,
-                    "trades": n,
-                    "wins": wins,
-                    "losses": losses,
-                    "win_rate_pct": round(100.0 * wins / n, 3) if n else "",
-                    "break_even_win_rate_pct": entry,
-                    "edge_vs_break_even_pct_points": round(
-                        (100.0 * wins / n) - entry, 3
-                    ) if n else "",
-                    "total_pnl_cents": round(pnl, 2),
-                    "avg_pnl_per_trade_cents": round(pnl / n, 3) if n else "",
-                })
-
-    return grid, trade_details
-
-def build_daily_and_monthly(trades: List[dict]):
-    # These rows summarize each grid cell by month.
-    monthly = defaultdict(lambda: {"trades": 0, "wins": 0, "pnl": 0.0})
-    daily = defaultdict(lambda: {"trades": 0, "wins": 0, "pnl": 0.0})
-
-    for t in trades:
-        key_base = (t["streak"], t["entry_cents"], t["window_minutes"])
-
-        mk = key_base + (t["month_utc"],)
-        monthly[mk]["trades"] += 1
-        monthly[mk]["wins"] += t["actual_reversal"]
-        monthly[mk]["pnl"] += t["pnl_cents"]
-
-        dk = key_base + (t["date_utc"],)
-        daily[dk]["trades"] += 1
-        daily[dk]["wins"] += t["actual_reversal"]
-        daily[dk]["pnl"] += t["pnl_cents"]
-
-    monthly_rows = []
-    for (streak, entry, window, month), d in monthly.items():
-        monthly_rows.append({
-            "streak": streak,
-            "entry_cents": entry,
-            "window_minutes": window,
-            "month_utc": month,
-            "trades": d["trades"],
-            "wins": d["wins"],
-            "win_rate_pct": round(100 * d["wins"] / d["trades"], 3),
-            "total_pnl_cents": round(d["pnl"], 2),
-            "avg_pnl_per_trade_cents": round(d["pnl"] / d["trades"], 3),
-        })
-
-    daily_rows = []
-    for (streak, entry, window, day), d in daily.items():
-        daily_rows.append({
-            "streak": streak,
-            "entry_cents": entry,
-            "window_minutes": window,
-            "date_utc": day,
-            "trades": d["trades"],
-            "wins": d["wins"],
-            "win_rate_pct": round(100 * d["wins"] / d["trades"], 3),
-            "total_pnl_cents": round(d["pnl"], 2),
-            "avg_pnl_per_trade_cents": round(d["pnl"] / d["trades"], 3),
-        })
-
-    return daily_rows, monthly_rows
 
 def main():
-    print("KALSHI KXBTC15M 10,000-MARKET VALIDATION BACKTEST")
-    print(f"series={SERIES}")
-    print(f"skip newest={MARKET_OFFSET:,} markets")
-    print(f"validation block={MAX_MARKETS:,} older markets")
-    print(
-        f"streaks={MIN_STREAK}-{MAX_STREAK} "
-        f"entries={MIN_ENTRY_CENTS}-{MAX_ENTRY_CENTS}c "
-        f"windows={MIN_WINDOW_MIN}-{MAX_WINDOW_MIN}m"
-    )
-    print("exit=HOLD TO CLOSE; stop=OFF; sell early=OFF")
-    print(f"output={OUT_DIR.resolve()}")
-    print()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", default="eth_data")
+    ap.add_argument("--max-markets", type=int, default=DEFAULT_MAX_MARKETS)
+    ap.add_argument("--fresh", action="store_true", help="Delete old candle/checkpoint/failure outputs and start fresh.")
+    args = ap.parse_args()
 
-    markets = fetch_selected_markets()
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"Selected {len(markets):,} strike rows spanning "
-        f"{markets[0]['close_time']} -> {markets[-1]['close_time']}"
-    )
+    sessions_path = outdir / "eth_15m_sessions_15k.csv"
+    candles_path = outdir / "eth_15m_candles_15k.csv"
+    raw_path = outdir / "eth_15m_market_raw_15k.jsonl"
+    checkpoint_path = outdir / "eth_15m_checkpoint.jsonl"
+    failures_path = outdir / "eth_15m_candle_failures.csv"
+    report_path = outdir / "eth_15m_download_report.txt"
 
-    sessions = derive_sessions(markets)
-    print(f"Derived {len(sessions):,} tradable sessions")
-    write_csv(OUT_DIR / "sessions_with_streaks.csv", sessions)
+    if args.fresh:
+        for p in [candles_path, checkpoint_path, failures_path, report_path]:
+            if p.exists():
+                p.unlink()
 
-    # RESUME SUPPORT ---------------------------------------------------------
-    # Load checkpointed data from the Railway volume first.
-    candles_by_ticker, all_candle_rows = load_existing_candles()
-    processed_tickers = load_processed_tickers()
+    session = requests.Session()
+    session.headers.update({"User-Agent": "kalshi-eth15m-research/2.0", "Accept": "application/json", "Connection": "keep-alive"})
 
-    # Backward-compatible recovery: if candles exist but the progress file was
-    # lost, treat candle-bearing tickers as processed.
-    processed_tickers.update(candles_by_ticker.keys())
+    print("=" * 70, flush=True)
+    print("ETH 15-MINUTE KALSHI DOWNLOADER v2", flush=True)
+    print(f"Series: {SERIES}", flush=True)
+    print(f"Target completed markets: {args.max_markets:,}", flush=True)
+    print(f"Candle timeout: {CANDLE_TIMEOUT}s; {CANDLE_ATTEMPTS_PER_ENDPOINT} attempts per endpoint", flush=True)
+    print("=" * 70, flush=True)
 
-    total = len(sessions)
-    already_done = sum(1 for s in sessions if s["ticker"] in processed_tickers)
-    if already_done:
-        print(
-            f"RESUME: found {already_done:,}/{total:,} already processed markets "
-            f"and {len(all_candle_rows):,} saved candle rows.",
-            flush=True,
-        )
-    else:
-        print("RESUME: no prior candle checkpoint found; starting candle collection.")
+    recent = paginate_markets(session, historical=False, max_markets=args.max_markets)
+    historical = paginate_markets(session, historical=True, max_markets=args.max_markets)
 
-    newly_processed = 0
+    by_ticker, source = {}, {}
+    for m in recent:
+        ticker = m.get("ticker")
+        if ticker:
+            by_ticker[ticker] = m
+            source[ticker] = "recent"
+    for m in historical:
+        ticker = m.get("ticker")
+        if ticker:
+            by_ticker[ticker] = m
+            source[ticker] = "historical"
 
-    for idx, s in enumerate(sessions, 1):
-        ticker = s["ticker"]
+    all_markets = list(by_ticker.values())
+    completed = []
+    for m in all_markets:
+        status = str(m.get("status") or "").lower()
+        result = str(m.get("result") or "").lower()
+        end = market_end_dt(m)
+        if end and (status in {"closed", "settled", "finalized"} or result in {"yes", "no"}):
+            completed.append(m)
 
-        if ticker in processed_tickers:
-            if idx % 100 == 0 or idx == total:
-                print(
-                    f"Candles: {idx:,}/{total:,} markets scanned; "
-                    f"{len(all_candle_rows):,} rows saved "
-                    f"(resume skipped {already_done:,})",
-                    flush=True,
-                )
-            continue
+    completed.sort(key=lambda m: market_end_dt(m) or datetime.max.replace(tzinfo=timezone.utc))
+    if len(completed) > args.max_markets:
+        completed = completed[-args.max_markets:]
 
-        cs = fetch_candles(
-            ticker,
-            s["session_start_ts"],
-            s["session_start_ts"] + 15 * 60
-        )
-        rows = [candle_row(s, c) for c in cs]
-        rows = [r for r in rows if 1 <= r["minute"] <= 15]
+    print(f"\nUnique markets found: {len(all_markets):,}\nCompleted markets selected: {len(completed):,}", flush=True)
+    if not completed:
+        raise RuntimeError("No completed KXETH15M markets found.")
 
-        # Write the candle rows FIRST, then mark the ticker complete.
-        # If the container dies between these two writes, a few duplicate rows
-        # are possible on restart; they are deduplicated below before analysis.
-        if rows:
-            append_csv_rows(CANDLE_FILE, rows)
+    with raw_path.open("w", encoding="utf-8") as f:
+        for m in completed:
+            ticker = m.get("ticker")
+            f.write(json.dumps({"_source_tier": source.get(ticker, ""), **m}, ensure_ascii=False) + "\n")
 
-        checkpoint_market(ticker, len(rows))
-        processed_tickers.add(ticker)
-        candles_by_ticker[ticker] = rows
-        all_candle_rows.extend(rows)
-        newly_processed += 1
+    session_rows = []
+    target_sources, settlement_sources = {}, {}
+    for m in completed:
+        ticker = m.get("ticker")
+        target, target_src = infer_target_price(m)
+        close_value, close_src = infer_settlement_value(m)
+        result = normalize_result(m, target, close_value)
+        start, end = market_start_dt(m), market_end_dt(m)
+        if target_src:
+            target_sources[target_src] = target_sources.get(target_src, 0) + 1
+        if close_src:
+            settlement_sources[close_src] = settlement_sources.get(close_src, 0) + 1
+        session_rows.append({
+            "ticker": ticker,
+            "session_start_utc": start.isoformat() if start else "",
+            "session_end_utc": end.isoformat() if end else "",
+            "status": m.get("status"),
+            "official_result": m.get("result"),
+            "target_price": target,
+            "target_price_source": target_src,
+            "closing_value": close_value,
+            "closing_value_source": close_src,
+            "normalized_result": result,
+            "volume": m.get("volume"),
+            "volume_fp": m.get("volume_fp"),
+            "open_interest": m.get("open_interest"),
+            "open_interest_fp": m.get("open_interest_fp"),
+            "yes_bid": m.get("yes_bid"),
+            "yes_ask": m.get("yes_ask"),
+            "no_bid": m.get("no_bid"),
+            "no_ask": m.get("no_ask"),
+            "last_price": m.get("last_price"),
+            "source_tier": source.get(ticker, ""),
+            "title": m.get("title"),
+            "subtitle": m.get("subtitle"),
+        })
 
-        if idx % 100 == 0 or idx == total:
-            print(
-                f"Candles: {idx:,}/{total:,} markets scanned; "
-                f"{len(all_candle_rows):,} rows saved; "
-                f"new this run={newly_processed:,}",
-                flush=True
-            )
+    with sessions_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(session_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(session_rows)
 
-        time.sleep(0.02)
-
-    # Deduplicate in memory in case a restart occurred between candle append
-    # and progress checkpoint for one market.
-    deduped = {}
-    for row in all_candle_rows:
-        key = (row.get("ticker"), row.get("candle_end_ts"))
-        deduped[key] = row
-    all_candle_rows = list(deduped.values())
-    all_candle_rows.sort(
-        key=lambda r: (r.get("ticker", ""), int(r.get("candle_end_ts") or 0))
-    )
-
-    candles_by_ticker = defaultdict(list)
-    for row in all_candle_rows:
-        candles_by_ticker[row["ticker"]].append(row)
-    candles_by_ticker = dict(candles_by_ticker)
-
-    grid, trades = run_grid(sessions, candles_by_ticker)
-    write_csv(OUT_DIR / "grid_results.csv", grid)
-
-    ranked = [
-        r for r in grid
-        if isinstance(r["avg_pnl_per_trade_cents"], (int, float))
+    candle_fields = [
+        "ticker", "session_start_utc", "session_end_utc", "candle_end_period", "minute_number", "source_tier",
+        "price_open", "price_high", "price_low", "price_close",
+        "price_open_dollars", "price_high_dollars", "price_low_dollars", "price_close_dollars",
+        "yes_bid_open", "yes_bid_high", "yes_bid_low", "yes_bid_close",
+        "yes_bid_open_dollars", "yes_bid_high_dollars", "yes_bid_low_dollars", "yes_bid_close_dollars",
+        "yes_ask_open", "yes_ask_high", "yes_ask_low", "yes_ask_close",
+        "yes_ask_open_dollars", "yes_ask_high_dollars", "yes_ask_low_dollars", "yes_ask_close_dollars",
+        "volume", "open_interest",
     ]
-    ranked.sort(
-        key=lambda r: (
-            r["avg_pnl_per_trade_cents"],
-            r["trades"],
-            r["total_pnl_cents"]
-        ),
-        reverse=True
-    )
 
-    write_csv(OUT_DIR / "grid_ranked_by_avg_pnl.csv", ranked)
-    write_csv(
-        OUT_DIR / "grid_ranked_min100_trades.csv",
-        [r for r in ranked if r["trades"] >= 100]
-    )
-    write_csv(
-        OUT_DIR / "grid_ranked_min250_trades.csv",
-        [r for r in ranked if r["trades"] >= 250]
-    )
+    done_tickers = read_checkpoint(checkpoint_path)
+    print(f"\nCheckpoint contains {len(done_tickers):,} already-processed markets.", flush=True)
 
-    daily_rows, monthly_rows = build_daily_and_monthly(trades)
-    write_csv(OUT_DIR / "daily_trade_results.csv", daily_rows)
-    write_csv(OUT_DIR / "monthly_strategy_summary.csv", monthly_rows)
+    candle_exists = candles_path.exists() and candles_path.stat().st_size > 0
+    fail_exists = failures_path.exists() and failures_path.stat().st_size > 0
+    candle_mode = "a" if candle_exists else "w"
+    fail_mode = "a" if fail_exists else "w"
 
-    summary = {
-        "series": SERIES,
-        "market_offset": MARKET_OFFSET,
-        "requested_validation_markets": MAX_MARKETS,
-        "selected_strike_rows": len(markets),
-        "derived_sessions": len(sessions),
-        "candle_rows": len(all_candle_rows),
-        "candle_progress_markets": len(processed_tickers),
-        "date_start": sessions[0]["session_start_utc"] if sessions else "",
-        "date_end": sessions[-1]["close_time"] if sessions else "",
-        "streak_range": [MIN_STREAK, MAX_STREAK],
-        "entry_cents_range": [MIN_ENTRY_CENTS, MAX_ENTRY_CENTS],
-        "window_minutes_range": [MIN_WINDOW_MIN, MAX_WINDOW_MIN],
-        "grid_cells": len(grid),
-        "exit_rule": "hold_to_close",
-        "stop_loss": "off",
-        "sell_early": "off",
-        "top_20_min250_trades": [
-            r for r in ranked if r["trades"] >= 250
-        ][:20],
-        "notes": "Kalshi-only; successive strikes; hold to close; no stop/early sell; checkpointed resume enabled."
-    }
+    processed_this_run = success_this_run = skipped_this_run = candle_rows_this_run = 0
+    start_clock = time.time()
 
-    (OUT_DIR / "run_summary.json").write_text(
-        json.dumps(summary, indent=2),
-        encoding="utf-8"
-    )
+    with candles_path.open(candle_mode, newline="", encoding="utf-8") as candle_f, failures_path.open(fail_mode, newline="", encoding="utf-8") as fail_f:
+        candle_writer = csv.DictWriter(candle_f, fieldnames=candle_fields)
+        if not candle_exists:
+            candle_writer.writeheader()
+        failure_fields = ["ticker", "preferred_tier", "error"]
+        failure_writer = csv.DictWriter(fail_f, fieldnames=failure_fields)
+        if not fail_exists:
+            failure_writer.writeheader()
 
-    print("\nDONE")
-    print(f"1-minute candle rows: {len(all_candle_rows):,}")
-    print(f"Grid cells: {len(grid):,}")
-    print(f"Saved to: {OUT_DIR.resolve()}")
+        for m in completed:
+            ticker = m.get("ticker")
+            if not ticker or ticker in done_tickers:
+                continue
+            start, end = market_start_dt(m), market_end_dt(m)
+            if not start or not end:
+                err = "missing session start/end"
+                failure_writer.writerow({"ticker": ticker, "preferred_tier": source.get(ticker, ""), "error": err})
+                fail_f.flush()
+                append_checkpoint(checkpoint_path, ticker, "skipped", 0, err)
+                skipped_this_run += 1
+                processed_this_run += 1
+                continue
 
-    robust = [r for r in ranked if r["trades"] >= 250]
-    if robust:
-        print("\nTop 15 with >=250 trades:")
-        for r in robust[:15]:
-            print(
-                f"s{r['streak']} {r['entry_cents']}c/{r['window_minutes']}m "
-                f"n={r['trades']} win={r['win_rate_pct']}% "
-                f"avg={r['avg_pnl_per_trade_cents']}c "
-                f"total={r['total_pnl_cents']}c"
-            )
+            start_ts = int(start.timestamp()) - 60
+            end_ts = int(end.timestamp()) + 60
+            preferred = source.get(ticker, "historical")
+            candles, used_tier, error = fetch_candles_with_fallback(session, ticker, start_ts, end_ts, preferred)
+            market_rows = 0
+
+            if candles:
+                for c in candles:
+                    row = {
+                        "ticker": ticker,
+                        "session_start_utc": start.isoformat(),
+                        "session_end_utc": end.isoformat(),
+                        "candle_end_period": c.get("end_period_ts"),
+                        "minute_number": "",
+                        "source_tier": used_tier,
+                        "volume": c.get("volume"),
+                        "open_interest": c.get("open_interest"),
+                    }
+                    ep = c.get("end_period_ts")
+                    try:
+                        ep_dt = datetime.fromtimestamp(int(ep), tz=timezone.utc)
+                        row["minute_number"] = int(round((ep_dt - start).total_seconds() / 60))
+                    except Exception:
+                        pass
+                    flatten_price("price", c.get("price"), row)
+                    flatten_price("yes_bid", c.get("yes_bid"), row)
+                    flatten_price("yes_ask", c.get("yes_ask"), row)
+                    candle_writer.writerow(row)
+                    market_rows += 1
+                candle_f.flush()
+                append_checkpoint(checkpoint_path, ticker, "success", market_rows, "")
+                success_this_run += 1
+                candle_rows_this_run += market_rows
+            else:
+                failure_writer.writerow({"ticker": ticker, "preferred_tier": preferred, "error": error})
+                fail_f.flush()
+                append_checkpoint(checkpoint_path, ticker, "skipped", 0, error)
+                skipped_this_run += 1
+
+            processed_this_run += 1
+            if processed_this_run % PROGRESS_EVERY == 0:
+                total_done = len(done_tickers) + processed_this_run
+                elapsed = max(time.time() - start_clock, 0.001)
+                rate = processed_this_run / elapsed
+                remaining = max(len(completed) - total_done, 0)
+                eta_min = (remaining / rate / 60) if rate > 0 else 0
+                print(f"Candles: {total_done:,}/{len(completed):,} markets processed | success {success_this_run:,} | skipped {skipped_this_run:,} | rows {candle_rows_this_run:,} | ETA ~{eta_min:.1f} min", flush=True)
+            time.sleep(REQUEST_PAUSE)
+
+    checkpoint_records = checkpoint_success = checkpoint_skipped = total_candle_rows = 0
+    if checkpoint_path.exists():
+        with checkpoint_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    checkpoint_records += 1
+                    if rec.get("status") == "success":
+                        checkpoint_success += 1
+                    elif rec.get("status") == "skipped":
+                        checkpoint_skipped += 1
+                    total_candle_rows += int(rec.get("candle_rows") or 0)
+                except Exception:
+                    pass
+
+    first_end, last_end = market_end_dt(completed[0]), market_end_dt(completed[-1])
+    report_lines = [
+        "ETH 15-MINUTE KALSHI DOWNLOAD REPORT", "=" * 50,
+        f"Series: {SERIES}",
+        f"Requested completed markets: {args.max_markets:,}",
+        f"Unique markets retrieved: {len(all_markets):,}",
+        f"Completed markets selected: {len(completed):,}",
+        f"First selected market end: {first_end.isoformat() if first_end else 'n/a'}",
+        f"Last selected market end: {last_end.isoformat() if last_end else 'n/a'}",
+        "", f"Checkpoint records: {checkpoint_records:,}",
+        f"Candle markets successful: {checkpoint_success:,}",
+        f"Candle markets skipped: {checkpoint_skipped:,}",
+        f"Total candle rows recorded: {total_candle_rows:,}",
+        "", "Target-price extraction sources:",
+    ]
+    for k, v in sorted(target_sources.items(), key=lambda kv: -kv[1]):
+        report_lines.append(f"  {k}: {v:,}")
+    report_lines += ["", "Settlement-value extraction sources:"]
+    for k, v in sorted(settlement_sources.items(), key=lambda kv: -kv[1]):
+        report_lines.append(f"  {k}: {v:,}")
+    report_lines += ["", f"Sessions file: {sessions_path}", f"Candles file: {candles_path}", f"Failures file: {failures_path}", f"Raw market file: {raw_path}", f"Checkpoint file: {checkpoint_path}"]
+    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+
+    print("\n" + "=" * 70, flush=True)
+    print("DONE", flush=True)
+    print(f"Sessions:   {sessions_path}", flush=True)
+    print(f"Candles:    {candles_path}", flush=True)
+    print(f"Failures:   {failures_path}", flush=True)
+    print(f"Raw JSON:   {raw_path}", flush=True)
+    print(f"Checkpoint: {checkpoint_path}", flush=True)
+    print(f"Report:     {report_path}", flush=True)
+    print("=" * 70, flush=True)
+
 
 if __name__ == "__main__":
     main()
