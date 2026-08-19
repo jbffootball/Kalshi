@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OIDIAG_V14_2026-08-18"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITRANS_V15_2026-08-18"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -100,6 +100,7 @@ OI_DIAGNOSTIC_MAX_SECONDS = float(os.getenv("OI_DIAGNOSTIC_MAX_SECONDS", "65"))
 OI_DIAGNOSTIC_REST_PROBE_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_SECONDS", "2"))
 OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS", "0.25"))
 OI_DIAGNOSTIC_LOG = os.getenv("OI_DIAGNOSTIC_LOG", "/data/s2_oi_diagnostic.csv")
+OI_DIAGNOSTIC_HIGH_RATIO = Decimal(os.getenv("OI_DIAGNOSTIC_HIGH_RATIO", "1.5"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
 
 EXIT_LOG_POLL_SECONDS = float(os.getenv("EXIT_LOG_POLL_SECONDS", "1"))
@@ -3022,16 +3023,20 @@ def monitor_position_once(position):
 
 
 # -----------------------------------------------------------------------------
-# S2 CURRENT-MARKET OPEN-INTEREST DIAGNOSTIC -- NO TRADING-RULE CHANGES
+# S2 CURRENT-MARKET OPEN-INTEREST TRANSITION DIAGNOSTIC -- NO TRADING-RULE CHANGES
 # -----------------------------------------------------------------------------
 _OI_WATCH_LOCK = threading.Lock()
 _OI_WATCHED_TICKERS = set()
 _OI_BASELINES = {}
+_OI_PRIOR_STATES = {}
 _OI_FIELDS = [
     "target_start_utc", "ticker", "received_time_utc", "elapsed_seconds",
     "source_time_utc", "open_interest_fp", "volume_fp", "price_dollars",
-    "yes_bid_dollars", "yes_ask_dollars", "baseline_12_final_oi_median",
-    "oi_ratio_to_baseline", "event",
+    "yes_bid_dollars", "yes_ask_dollars",
+    "baseline_12_minute1_oi_median", "oi_ratio_to_baseline",
+    "prior_market_ticker", "prior_market_minute1_oi",
+    "prior_market_baseline_12_minute1_oi_median", "prior_market_oi_ratio",
+    "prior_oi_state", "current_oi_state", "oi_transition", "event",
 ]
 
 
@@ -3058,9 +3063,27 @@ def _median_decimal(values):
     return (vals[n // 2 - 1] + vals[n // 2]) / Decimal("2")
 
 
+def _oi_state(ratio):
+    if ratio is None:
+        return "UNKNOWN"
+    return "HIGH" if ratio >= OI_DIAGNOSTIC_HIGH_RATIO else "NORMAL"
+
+
 def _ensure_oi_log():
     p = Path(OI_DIAGNOSTIC_LOG)
     p.parent.mkdir(parents=True, exist_ok=True)
+    # V15 has a wider schema than V14. Start a fresh file if the existing header
+    # is from an older diagnostic so rows remain machine-readable.
+    expected = ",".join(_OI_FIELDS)
+    if p.exists() and p.stat().st_size:
+        try:
+            first = p.open("r", encoding="utf-8").readline().strip()
+            if first != expected:
+                backup = p.with_name(p.stem + "_pre_v15" + p.suffix)
+                p.replace(backup)
+                print(f"OI DIAGNOSTIC LOG ROTATED: old={backup}", flush=True)
+        except Exception:
+            pass
     if not p.exists() or p.stat().st_size == 0:
         with p.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=_OI_FIELDS).writeheader()
@@ -3075,49 +3098,107 @@ def _append_oi_log(row):
         print(f"OI DIAGNOSTIC LOG WARNING: {exc!r}", flush=True)
 
 
-def _trailing_final_oi_baseline(target_start, exclude_ticker=None):
-    """Best-effort trailing final-OI median for completed markets before target_start.
+def _first_session_minute_oi(market):
+    """Return OI from the first 1-minute candle of this 15-minute BTC session.
 
-    This baseline is diagnostic only. We use market-level OI from completed/closed
-    market objects and keep it separate from the real-time current-market OI stream.
+    KXBTC15M market objects can exist before their actual 15-minute observation
+    window, so session start is inferred as close_time - 15 minutes. The first
+    session candle ends one minute later (close_time - 14 minutes).
     """
+    ticker = market.get("ticker") or ""
+    close_dt = parse_time(market.get("close_time"))
+    if not ticker or close_dt is None:
+        return None
+    first_end = close_dt - dt.timedelta(minutes=14)
+    ts = int(first_end.timestamp())
     try:
-        data = get_json("/markets", {"series_ticker": SERIES, "limit": 1000})
-        candidates = []
-        for m in data.get("markets", []):
-            if exclude_ticker and m.get("ticker") == exclude_ticker:
-                continue
-            close_dt = parse_time(m.get("close_time"))
-            if close_dt is None or close_dt > target_start:
-                continue
-            oi = _market_oi(m)
-            if oi is None:
-                continue
-            candidates.append((close_dt, m.get("ticker") or "", oi))
-        candidates.sort(key=lambda x: x[0])
-        tail = candidates[-max(1, OI_DIAGNOSTIC_LOOKBACK_MARKETS):]
-        med = _median_decimal([x[2] for x in tail])
-        return med, tail
+        data = get_json(
+            f"/series/{SERIES}/markets/{ticker}/candlesticks",
+            {"start_ts": ts, "end_ts": ts, "period_interval": 1},
+        )
+        candles = data.get("candlesticks") or []
+        if not candles:
+            return None
+        # Prefer an exact end timestamp; otherwise accept the closest returned row.
+        row = min(candles, key=lambda c: abs(int(c.get("end_period_ts", ts)) - ts))
+        return _oi_decimal(row.get("open_interest_fp", row.get("open_interest")))
     except Exception as exc:
-        print(f"OI BASELINE WARNING: {exc!r}", flush=True)
-        return None, []
+        print(f"OI MINUTE1 WARNING: ticker={ticker} error={exc!r}", flush=True)
+        return None
+
+
+def _minute1_oi_context(target_start, exclude_ticker=None):
+    """Build apples-to-apples minute-1 OI context from the 13 prior markets.
+
+    Current-market baseline = median minute-1 OI of the immediately prior 12.
+    Prior-market ratio = prior market minute-1 OI / median minute-1 OI of the
+    12 markets before it. This lets V15 label NORMAL->HIGH transitions live.
+    """
+    data = get_json("/markets", {"series_ticker": SERIES, "limit": 1000})
+    candidates = []
+    for m in data.get("markets", []):
+        if exclude_ticker and m.get("ticker") == exclude_ticker:
+            continue
+        close_dt = parse_time(m.get("close_time"))
+        if close_dt is None or close_dt > target_start:
+            continue
+        candidates.append((close_dt, m))
+    candidates.sort(key=lambda x: x[0])
+    selected = candidates[-13:]
+    samples = []
+    for close_dt, m in selected:
+        oi = _first_session_minute_oi(m)
+        if oi is not None:
+            samples.append((close_dt, m.get("ticker") or "", oi))
+    if len(samples) < 13:
+        return None
+    samples.sort(key=lambda x: x[0])
+    prior = samples[-1]
+    prior_baseline = _median_decimal([x[2] for x in samples[-13:-1]])
+    current_baseline = _median_decimal([x[2] for x in samples[-12:]])
+    prior_ratio = (prior[2] / prior_baseline) if prior_baseline not in (None, Decimal("0")) else None
+    return {
+        "current_baseline": current_baseline,
+        "prior_ticker": prior[1],
+        "prior_oi": prior[2],
+        "prior_baseline": prior_baseline,
+        "prior_ratio": prior_ratio,
+        "prior_state": _oi_state(prior_ratio),
+        "samples": samples,
+    }
 
 
 def _oi_baseline_worker(ticker, target_start):
-    med, tail = _trailing_final_oi_baseline(target_start, exclude_ticker=ticker)
+    try:
+        ctx = _minute1_oi_context(target_start, exclude_ticker=ticker)
+    except Exception as exc:
+        print(f"OI BASELINE WARNING: {exc!r}", flush=True)
+        ctx = None
     with _OI_WATCH_LOCK:
-        _OI_BASELINES[ticker] = med
-    if med is None:
-        print(
-            f"OI BASELINE UNAVAILABLE: ticker={ticker} target_start={target_start.isoformat()}",
-            flush=True,
-        )
+        _OI_BASELINES[ticker] = ctx.get("current_baseline") if ctx else None
+        _OI_PRIOR_STATES[ticker] = ctx or {}
+    if not ctx or ctx.get("current_baseline") is None:
+        print(f"OI BASELINE UNAVAILABLE: ticker={ticker} target_start={target_start.isoformat()}", flush=True)
         return
     print(
-        f"OI BASELINE READY: ticker={ticker} lookback={len(tail)} "
-        f"median_final_oi={med} target_start={target_start.isoformat()}",
+        f"OI BASELINE READY: ticker={ticker} basis=MINUTE1 lookback=12 "
+        f"median_minute1_oi={ctx['current_baseline']} prior_ticker={ctx['prior_ticker']} "
+        f"prior_minute1_oi={ctx['prior_oi']} prior_ratio="
+        f"{f'{ctx['prior_ratio']:.3f}x' if ctx['prior_ratio'] is not None else '?'} "
+        f"prior_state={ctx['prior_state']} high_cutoff={OI_DIAGNOSTIC_HIGH_RATIO}x",
         flush=True,
     )
+
+
+def _oi_context_snapshot(ticker, oi):
+    with _OI_WATCH_LOCK:
+        baseline = _OI_BASELINES.get(ticker)
+        prior = dict(_OI_PRIOR_STATES.get(ticker) or {})
+    ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
+    current_state = _oi_state(ratio)
+    prior_state = prior.get("prior_state", "UNKNOWN")
+    transition = f"{prior_state}->{current_state}"
+    return baseline, ratio, prior, current_state, transition
 
 
 async def _oi_market_ticker_loop(ticker, target_start):
@@ -3133,11 +3214,7 @@ async def _oi_market_ticker_loop(ticker, target_start):
         ping_timeout=20,
         close_timeout=5,
     ) as ws:
-        sub = {
-            "id": 8101,
-            "cmd": "subscribe",
-            "params": {"channels": ["market_ticker"], "market_ticker": ticker},
-        }
+        sub = {"id": 8101, "cmd": "subscribe", "params": {"channels": ["market_ticker"], "market_ticker": ticker}}
         await ws.send(json.dumps(sub))
         print(f"OI WS SUBSCRIBE SENT: ticker={ticker} channel=market_ticker", flush=True)
         while utc_now() <= deadline:
@@ -3162,32 +3239,29 @@ async def _oi_market_ticker_loop(ticker, target_start):
             elapsed = (received - target_start).total_seconds()
             oi = _oi_decimal(msg.get("open_interest_fp"))
             vol = _oi_decimal(msg.get("volume_fp"))
-            with _OI_WATCH_LOCK:
-                baseline = _OI_BASELINES.get(ticker)
-            ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
+            baseline, ratio, prior, current_state, transition = _oi_context_snapshot(ticker, oi)
             source_time = msg.get("time") or (str(msg.get("ts_ms")) if msg.get("ts_ms") is not None else "")
             event = "FIRST_UPDATE" if first_update else "UPDATE"
             _append_oi_log({
-                "target_start_utc": target_start.isoformat(),
-                "ticker": ticker,
-                "received_time_utc": received.isoformat(),
-                "elapsed_seconds": f"{elapsed:.3f}",
-                "source_time_utc": source_time,
-                "open_interest_fp": str(oi) if oi is not None else "",
-                "volume_fp": str(vol) if vol is not None else "",
-                "price_dollars": msg.get("price_dollars", ""),
-                "yes_bid_dollars": msg.get("yes_bid_dollars", ""),
-                "yes_ask_dollars": msg.get("yes_ask_dollars", ""),
-                "baseline_12_final_oi_median": str(baseline) if baseline is not None else "",
+                "target_start_utc": target_start.isoformat(), "ticker": ticker,
+                "received_time_utc": received.isoformat(), "elapsed_seconds": f"{elapsed:.3f}",
+                "source_time_utc": source_time, "open_interest_fp": str(oi) if oi is not None else "",
+                "volume_fp": str(vol) if vol is not None else "", "price_dollars": msg.get("price_dollars", ""),
+                "yes_bid_dollars": msg.get("yes_bid_dollars", ""), "yes_ask_dollars": msg.get("yes_ask_dollars", ""),
+                "baseline_12_minute1_oi_median": str(baseline) if baseline is not None else "",
                 "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
-                "event": event,
+                "prior_market_ticker": prior.get("prior_ticker", ""),
+                "prior_market_minute1_oi": str(prior.get("prior_oi", "")),
+                "prior_market_baseline_12_minute1_oi_median": str(prior.get("prior_baseline", "")),
+                "prior_market_oi_ratio": f"{prior.get('prior_ratio'):.4f}" if prior.get("prior_ratio") is not None else "",
+                "prior_oi_state": prior.get("prior_state", "UNKNOWN"), "current_oi_state": current_state,
+                "oi_transition": transition, "event": event,
             })
-            if first_update or elapsed <= 2.0 or (int(max(0, elapsed)) in {5, 10, 15, 30, 60}):
+            if first_update or elapsed <= 2.0 or int(max(0, elapsed)) in {5, 10, 15, 30, 60}:
                 print(
                     f"OI {event}: ticker={ticker} t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
-                    f"volume={vol if vol is not None else '?'} baseline12={baseline if baseline is not None else '?'} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'}",
-                    flush=True,
+                    f"baseline12_m1={baseline if baseline is not None else '?'} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
                 )
             first_update = False
     print(f"OI WS COMPLETE: ticker={ticker} window={OI_DIAGNOSTIC_MAX_SECONDS:g}s", flush=True)
@@ -3201,11 +3275,6 @@ def _oi_ws_worker(ticker, target_start):
 
 
 def _oi_fast_rest_probe_worker(ticker, target_start):
-    """Non-blocking fast REST snapshots for the first ~2 seconds.
-
-    This is intentionally independent of order submission. It tells us the earliest
-    elapsed time at which Kalshi's REST market object exposes current-market OI.
-    """
     deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_REST_PROBE_SECONDS)
     attempt = 0
     first_ok = True
@@ -3217,46 +3286,39 @@ def _oi_fast_rest_probe_worker(ticker, target_start):
             elapsed = (received - target_start).total_seconds()
             oi = _market_oi(market)
             vol = _oi_decimal(market.get("volume_fp", market.get("volume")))
-            with _OI_WATCH_LOCK:
-                baseline = _OI_BASELINES.get(ticker)
-            ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
+            baseline, ratio, prior, current_state, transition = _oi_context_snapshot(ticker, oi)
             _append_oi_log({
-                "target_start_utc": target_start.isoformat(),
-                "ticker": ticker,
-                "received_time_utc": received.isoformat(),
-                "elapsed_seconds": f"{elapsed:.3f}",
+                "target_start_utc": target_start.isoformat(), "ticker": ticker,
+                "received_time_utc": received.isoformat(), "elapsed_seconds": f"{elapsed:.3f}",
                 "source_time_utc": market.get("updated_time", ""),
-                "open_interest_fp": str(oi) if oi is not None else "",
-                "volume_fp": str(vol) if vol is not None else "",
+                "open_interest_fp": str(oi) if oi is not None else "", "volume_fp": str(vol) if vol is not None else "",
                 "price_dollars": market.get("last_price_dollars", market.get("last_price", "")),
-                "yes_bid_dollars": market.get("yes_bid_dollars", ""),
-                "yes_ask_dollars": market.get("yes_ask_dollars", ""),
-                "baseline_12_final_oi_median": str(baseline) if baseline is not None else "",
+                "yes_bid_dollars": market.get("yes_bid_dollars", ""), "yes_ask_dollars": market.get("yes_ask_dollars", ""),
+                "baseline_12_minute1_oi_median": str(baseline) if baseline is not None else "",
                 "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
-                "event": "REST_FIRST" if first_ok else "REST_PROBE",
+                "prior_market_ticker": prior.get("prior_ticker", ""), "prior_market_minute1_oi": str(prior.get("prior_oi", "")),
+                "prior_market_baseline_12_minute1_oi_median": str(prior.get("prior_baseline", "")),
+                "prior_market_oi_ratio": f"{prior.get('prior_ratio'):.4f}" if prior.get("prior_ratio") is not None else "",
+                "prior_oi_state": prior.get("prior_state", "UNKNOWN"), "current_oi_state": current_state,
+                "oi_transition": transition, "event": "REST_FIRST" if first_ok else "REST_PROBE",
             })
             if first_ok or elapsed <= 1.1:
                 print(
-                    f"OI REST {'FIRST' if first_ok else 'PROBE'}: ticker={ticker} "
-                    f"attempt={attempt} t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
-                    f"baseline12={baseline if baseline is not None else '?'} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'}",
-                    flush=True,
+                    f"OI REST {'FIRST' if first_ok else 'PROBE'}: ticker={ticker} attempt={attempt} "
+                    f"t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
+                    f"baseline12_m1={baseline if baseline is not None else '?'} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
                 )
             first_ok = False
         except Exception as exc:
             elapsed = (utc_now() - target_start).total_seconds()
             if attempt <= 3:
-                print(
-                    f"OI REST NOT READY: ticker={ticker} attempt={attempt} "
-                    f"t={elapsed:+.3f}s error={exc!r}",
-                    flush=True,
-                )
+                print(f"OI REST NOT READY: ticker={ticker} attempt={attempt} t={elapsed:+.3f}s error={exc!r}", flush=True)
         time.sleep(max(0.05, OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS))
 
 
 def start_s2_oi_diagnostic(ticker, target_start, trigger_streak):
-    """Start non-blocking S2 OI collection once per market ticker."""
+    """Start non-blocking S2 OI transition collection once per market ticker."""
     if not OI_DIAGNOSTIC_ENABLED or int(trigger_streak) != 2 or not ticker:
         return
     with _OI_WATCH_LOCK:
@@ -3264,29 +3326,15 @@ def start_s2_oi_diagnostic(ticker, target_start, trigger_streak):
             return
         _OI_WATCHED_TICKERS.add(ticker)
     print(
-        f"OI DIAGNOSTIC START: ticker={ticker} streak={trigger_streak} "
-        f"lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} max_seconds={OI_DIAGNOSTIC_MAX_SECONDS:g} "
-        "TRADING_RULES_UNCHANGED",
-        flush=True,
+        f"OI DIAGNOSTIC START: ticker={ticker} streak={trigger_streak} basis=MINUTE1 "
+        f"lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} high_cutoff={OI_DIAGNOSTIC_HIGH_RATIO}x "
+        f"max_seconds={OI_DIAGNOSTIC_MAX_SECONDS:g} TRADING_RULES_UNCHANGED", flush=True,
     )
-    threading.Thread(
-        target=_oi_baseline_worker,
-        args=(ticker, target_start),
-        daemon=True,
-        name=f"oi-baseline-{ticker}",
-    ).start()
-    threading.Thread(
-        target=_oi_ws_worker,
-        args=(ticker, target_start),
-        daemon=True,
-        name=f"oi-ws-{ticker}",
-    ).start()
-    threading.Thread(
-        target=_oi_fast_rest_probe_worker,
-        args=(ticker, target_start),
-        daemon=True,
-        name=f"oi-rest-{ticker}",
-    ).start()
+    # Build the historical minute-1 context first in its own thread. WS/REST start
+    # immediately as separate threads; early rows may say UNKNOWN until baseline is ready.
+    threading.Thread(target=_oi_baseline_worker, args=(ticker, target_start), daemon=True, name=f"oi-baseline-{ticker}").start()
+    threading.Thread(target=_oi_ws_worker, args=(ticker, target_start), daemon=True, name=f"oi-ws-{ticker}").start()
+    threading.Thread(target=_oi_fast_rest_probe_worker, args=(ticker, target_start), daemon=True, name=f"oi-rest-{ticker}").start()
 
 
 # -----------------------------------------------------------------------------
