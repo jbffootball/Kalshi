@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITIMING_V16_2026-08-19"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITIMING_DUPGUARD_V17_2026-08-19"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -2417,6 +2417,114 @@ def order_remaining_count(order):
     return 0.0
 
 
+def _order_float(order, *keys):
+    for key in keys:
+        try:
+            value = order.get(key)
+            if value not in (None, ""):
+                return float(value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def resting_order_effective_entry_cents(order):
+    """Return (outcome_side, entry_cents) for a V2 resting order when possible."""
+    outcome_side = str(order.get("outcome_side") or "").strip().lower()
+
+    if outcome_side == "yes":
+        px = _order_float(order, "yes_price_dollars", "price_dollars")
+        if px is not None:
+            return "yes", round(px * 100.0, 4)
+    elif outcome_side == "no":
+        px = _order_float(order, "no_price_dollars")
+        if px is not None:
+            return "no", round(px * 100.0, 4)
+
+    # Fall back to the single-book V2 side/price representation.
+    book_side = str(order.get("book_side") or order.get("side") or "").strip().lower()
+    px = _order_float(order, "price_dollars", "yes_price_dollars")
+    if px is not None:
+        if book_side == "bid":
+            return "yes", round(px * 100.0, 4)
+        if book_side == "ask":
+            return "no", round((1.0 - px) * 100.0, 4)
+
+    # Last-resort outcome-specific fields.
+    yes_px = _order_float(order, "yes_price_dollars")
+    no_px = _order_float(order, "no_price_dollars")
+    if yes_px is not None and no_px is None:
+        return "yes", round(yes_px * 100.0, 4)
+    if no_px is not None and yes_px is None:
+        return "no", round(no_px * 100.0, 4)
+    return None, None
+
+
+def find_matching_resting_entry_order(ticker, side, limit_cents):
+    """
+    Restart-safe duplicate guard.
+
+    Query Kalshi for resting orders on this ticker and return an already-resting
+    order only when it matches the intended outcome side and entry price.
+    This prevents a process restart/redeploy from posting the same entry twice.
+    """
+    if MODE not in {"demo", "live"} or not PLACE_ORDERS:
+        return None
+    try:
+        query_ticker = requests.utils.quote(str(ticker), safe="")
+        resp = authenticated_request(
+            "GET",
+            f"/portfolio/orders?ticker={query_ticker}&status=resting&limit=100",
+        )
+        orders = resp.get("orders", []) if isinstance(resp, dict) else []
+    except Exception as e:
+        # Fail closed for order safety: if we cannot verify that no duplicate
+        # exists, do not blindly create another real-money order.
+        print(
+            f"DUPLICATE GUARD ERROR: ticker={ticker} unable to query resting orders: {e!r}"
+        )
+        return {"_duplicate_guard_query_failed": True}
+
+    matches = []
+    intended_side = str(side).lower()
+    intended_price = float(limit_cents)
+    for order in orders:
+        remaining = order_remaining_count(order)
+        if remaining <= 0:
+            continue
+        order_side, order_entry = resting_order_effective_entry_cents(order)
+        if order_side != intended_side or order_entry is None:
+            continue
+        if abs(float(order_entry) - intended_price) <= 0.01:
+            matches.append(order)
+
+    if not matches:
+        print(
+            f"DUPLICATE GUARD CLEAR: ticker={ticker} {intended_side.upper()} "
+            f"@ {limit_cents}c no matching resting order."
+        )
+        return None
+
+    # Oldest first is the safest order to adopt because it has queue priority.
+    matches.sort(key=lambda o: str(o.get("created_time") or ""))
+    existing = dict(matches[0])
+    existing["_duplicate_guard_reused"] = True
+    if len(matches) > 1:
+        print(
+            f"DUPLICATE GUARD WARNING: found {len(matches)} matching resting orders "
+            f"for {ticker} {intended_side.upper()} @ {limit_cents}c. "
+            f"Adopting oldest order_id={existing.get('order_id')} and submitting NO new order. "
+            "Existing extra duplicates are NOT auto-canceled."
+        )
+    else:
+        print(
+            f"DUPLICATE GUARD HIT: adopting existing resting order "
+            f"order_id={existing.get('order_id')} ticker={ticker} "
+            f"{intended_side.upper()} @ {limit_cents}c; NO NEW ORDER POSTED."
+        )
+    return existing
+
+
 def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, contracts):
     """
     Submit a resting API order.
@@ -2448,6 +2556,21 @@ def submit_resting_order_with_retry(ticker, side, limit_cents, expiration_ts, co
                 f"SUBMIT ATTEMPT {attempt}/{ORDER_SUBMIT_RETRIES}: "
                 f"{ticker} {side.upper()} @ {limit_cents}c"
             )
+
+            existing = find_matching_resting_entry_order(ticker, side, limit_cents)
+            if existing is not None:
+                if existing.get("_duplicate_guard_query_failed"):
+                    print(
+                        f"SUBMIT BLOCKED BY DUPLICATE GUARD: could not verify resting orders "
+                        f"for {ticker}; refusing to risk duplicate real-money entry."
+                    )
+                    return "failed", None
+                latency_mark(
+                    "ORDER_REUSED",
+                    detail=f"ticker={ticker} order_id={existing.get('order_id','?')}",
+                )
+                return "accepted", existing
+
             order = place_resting_limit_order(
                 ticker, side, limit_cents, expiration_ts, contracts
             )
