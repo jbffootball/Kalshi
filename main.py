@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITRANS_V15_2026-08-18"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITIMING_V16_2026-08-19"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -3205,6 +3205,7 @@ async def _oi_market_ticker_loop(ticker, target_start):
     ws_url = cfbenchmarks_ws_url()
     headers = websocket_auth_headers()
     first_update = True
+    first_nonzero = True
     deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_MAX_SECONDS)
     print(f"OI WS CONNECTING: ticker={ticker}", flush=True)
     async with websockets.connect(
@@ -3214,9 +3215,9 @@ async def _oi_market_ticker_loop(ticker, target_start):
         ping_timeout=20,
         close_timeout=5,
     ) as ws:
-        sub = {"id": 8101, "cmd": "subscribe", "params": {"channels": ["market_ticker"], "market_ticker": ticker}}
+        sub = {"id": 8101, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": [ticker]}}
         await ws.send(json.dumps(sub))
-        print(f"OI WS SUBSCRIBE SENT: ticker={ticker} channel=market_ticker", flush=True)
+        print(f"OI WS SUBSCRIBE SENT: ticker={ticker} channel=ticker", flush=True)
         while utc_now() <= deadline:
             timeout = max(0.05, min(2.0, (deadline - utc_now()).total_seconds()))
             try:
@@ -3241,7 +3242,11 @@ async def _oi_market_ticker_loop(ticker, target_start):
             vol = _oi_decimal(msg.get("volume_fp"))
             baseline, ratio, prior, current_state, transition = _oi_context_snapshot(ticker, oi)
             source_time = msg.get("time") or (str(msg.get("ts_ms")) if msg.get("ts_ms") is not None else "")
-            event = "FIRST_UPDATE" if first_update else "UPDATE"
+            is_nonzero = oi is not None and oi > 0
+            if is_nonzero and first_nonzero:
+                event = "FIRST_NONZERO"
+            else:
+                event = "FIRST_UPDATE" if first_update else "UPDATE"
             _append_oi_log({
                 "target_start_utc": target_start.isoformat(), "ticker": ticker,
                 "received_time_utc": received.isoformat(), "elapsed_seconds": f"{elapsed:.3f}",
@@ -3264,6 +3269,12 @@ async def _oi_market_ticker_loop(ticker, target_start):
                     f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
                 )
             first_update = False
+            if is_nonzero and first_nonzero:
+                print(
+                    f"OI FIRST NONZERO: ticker={ticker} source=WS t={elapsed:+.3f}s oi={oi} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
+                )
+                first_nonzero = False
     print(f"OI WS COMPLETE: ticker={ticker} window={OI_DIAGNOSTIC_MAX_SECONDS:g}s", flush=True)
 
 
@@ -3278,6 +3289,7 @@ def _oi_fast_rest_probe_worker(ticker, target_start):
     deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_REST_PROBE_SECONDS)
     attempt = 0
     first_ok = True
+    first_nonzero = True
     while utc_now() <= deadline:
         attempt += 1
         try:
@@ -3309,6 +3321,12 @@ def _oi_fast_rest_probe_worker(ticker, target_start):
                     f"baseline12_m1={baseline if baseline is not None else '?'} "
                     f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
                 )
+            if oi is not None and oi > 0 and first_nonzero:
+                print(
+                    f"OI FIRST NONZERO: ticker={ticker} source=REST t={elapsed:+.3f}s oi={oi} "
+                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
+                )
+                first_nonzero = False
             first_ok = False
         except Exception as exc:
             elapsed = (utc_now() - target_start).total_seconds()
