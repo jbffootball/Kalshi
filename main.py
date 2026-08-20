@@ -18,7 +18,15 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_OITIMING_DUPGUARD_V19_2026-08-19"
+
+def env_bool(name, default=False):
+    """Parse a boolean environment variable with a safe default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_DYNSIZE_BALVERIFY_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_DUPGUARD_V20_1_2026-08-20"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -71,37 +79,21 @@ FAST_BOUNDARY_ENABLED = os.getenv("FAST_BOUNDARY_ENABLED", "true").strip().lower
 FAST_DIRECT_RETRY_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_SECONDS", "0.25"))
 FAST_DIRECT_RETRY_MAX_SECONDS = float(os.getenv("FAST_DIRECT_RETRY_MAX_SECONDS", "20"))
 DEBUG_LIVE_DATA = os.getenv("DEBUG_LIVE_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
-LIVE_DATA_DIAGNOSTIC_ENABLED = os.getenv("LIVE_DATA_DIAGNOSTIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS", "60"))
-LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS = float(os.getenv("LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS", "8"))
-STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED = os.getenv("STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-STRIKE_VISIBILITY_POLL_SECONDS = float(os.getenv("STRIKE_VISIBILITY_POLL_SECONDS", "2"))
-STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS = float(os.getenv("STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS", "180"))
-CFBENCHMARKS_DIAGNOSTIC_ENABLED = os.getenv("CFBENCHMARKS_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+CFBENCHMARKS_FEED_ENABLED = os.getenv(
+    "CFBENCHMARKS_FEED_ENABLED",
+    os.getenv("CFBENCHMARKS_FEED_ENABLED", "true"),
+).strip().lower() in {"1", "true", "yes", "on"}
 CFBENCHMARKS_INDEX_ID = os.getenv("CFBENCHMARKS_INDEX_ID", "BRTI").strip() or "BRTI"
 CFBENCHMARKS_RECONNECT_SECONDS = float(os.getenv("CFBENCHMARKS_RECONNECT_SECONDS", "3"))
 CFBENCHMARKS_TRADING_TRIGGER_ENABLED = os.getenv("CFBENCHMARKS_TRADING_TRIGGER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CFBENCHMARKS_FINAL_WAIT_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_WAIT_SECONDS", "3"))
 CFBENCHMARKS_FINAL_POLL_SECONDS = float(os.getenv("CFBENCHMARKS_FINAL_POLL_SECONDS", "0.01"))
-STOP_LOSS_CENTS = float(os.getenv("STOP_LOSS_CENTS", "0"))
-SELL_EARLY_CENTS = float(os.getenv("SELL_EARLY_CENTS", "100"))
 S2_SELL_EARLY_CENTS = float(os.getenv("S2_SELL_EARLY_CENTS", "100"))
 S3_SELL_EARLY_CENTS = float(os.getenv("S3_SELL_EARLY_CENTS", "96"))
 S4_SELL_EARLY_CENTS = float(os.getenv("S4_SELL_EARLY_CENTS", "96"))
 S5_SELL_EARLY_CENTS = float(os.getenv("S5_SELL_EARLY_CENTS", "96"))
 S6_SELL_EARLY_CENTS = float(os.getenv("S6_SELL_EARLY_CENTS", "100"))
 
-# S2 current-market open-interest diagnostic. Diagnostic only: never blocks, delays,
-# cancels, or modifies an order. It records the earliest Kalshi market_ticker OI
-# updates after the new 15-minute market begins so we can determine whether an OI
-# filter is observable within ~1 second.
-OI_DIAGNOSTIC_ENABLED = os.getenv("OI_DIAGNOSTIC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-OI_DIAGNOSTIC_LOOKBACK_MARKETS = int(os.getenv("OI_DIAGNOSTIC_LOOKBACK_MARKETS", "12"))
-OI_DIAGNOSTIC_MAX_SECONDS = float(os.getenv("OI_DIAGNOSTIC_MAX_SECONDS", "65"))
-OI_DIAGNOSTIC_REST_PROBE_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_SECONDS", "2"))
-OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS = float(os.getenv("OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS", "0.25"))
-OI_DIAGNOSTIC_LOG = os.getenv("OI_DIAGNOSTIC_LOG", "/data/s2_oi_diagnostic.csv")
-OI_DIAGNOSTIC_HIGH_RATIO = Decimal(os.getenv("OI_DIAGNOSTIC_HIGH_RATIO", "1.5"))
 POLL_POSITION_SECONDS = float(os.getenv("POLL_POSITION_SECONDS", "2"))
 
 EXIT_LOG_POLL_SECONDS = float(os.getenv("EXIT_LOG_POLL_SECONDS", "1"))
@@ -116,35 +108,9 @@ PERFORMANCE_LOG = os.getenv(
     "PERFORMANCE_LOG", "/data/current_strategy_performance.csv"
 )
 
-TAKE_PROFIT_GT3_CENTS = float(os.getenv("TAKE_PROFIT_GT3_CENTS", "95"))
-TAKE_PROFIT_2_TO_3_CENTS = float(os.getenv("TAKE_PROFIT_2_TO_3_CENTS", "90"))
-TAKE_PROFIT_1_TO_2_CENTS = float(os.getenv("TAKE_PROFIT_1_TO_2_CENTS", "85"))
-TAKE_PROFIT_LT1_CENTS = float(os.getenv("TAKE_PROFIT_LT1_CENTS", "80"))
-
-STOP_LOSS_GT3_CENTS = float(os.getenv("STOP_LOSS_GT3_CENTS", "5"))
-STOP_LOSS_2_TO_3_CENTS = float(os.getenv("STOP_LOSS_2_TO_3_CENTS", "10"))
-STOP_LOSS_1_TO_2_CENTS = float(os.getenv("STOP_LOSS_1_TO_2_CENTS", "15"))
-STOP_LOSS_LT1_CENTS = float(os.getenv("STOP_LOSS_LT1_CENTS", "20"))
-
-for _name, _value in {
-    "TAKE_PROFIT_GT3_CENTS": TAKE_PROFIT_GT3_CENTS,
-    "TAKE_PROFIT_2_TO_3_CENTS": TAKE_PROFIT_2_TO_3_CENTS,
-    "TAKE_PROFIT_1_TO_2_CENTS": TAKE_PROFIT_1_TO_2_CENTS,
-    "TAKE_PROFIT_LT1_CENTS": TAKE_PROFIT_LT1_CENTS,
-    "STOP_LOSS_GT3_CENTS": STOP_LOSS_GT3_CENTS,
-    "STOP_LOSS_2_TO_3_CENTS": STOP_LOSS_2_TO_3_CENTS,
-    "STOP_LOSS_1_TO_2_CENTS": STOP_LOSS_1_TO_2_CENTS,
-    "STOP_LOSS_LT1_CENTS": STOP_LOSS_LT1_CENTS,
-}.items():
-    if not 0 <= _value <= 100:
-        raise RuntimeError(f"{_name} must be between 0 and 100.")
-
-def env_bool(name, default=False):
-    return os.getenv(name, "true" if default else "false").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
-TIME_EXIT_ENABLED = env_bool("TIME_EXIT_ENABLED", True)
+# Read-only startup check used to verify the exact Kalshi balance fields before
+# enabling percent sizing broadly. This never places or modifies an order.
+BALANCE_VERIFY_ON_START = env_bool("BALANCE_VERIFY_ON_START", True)
 
 EXIT_LOGGING_ENABLED = env_bool("EXIT_LOGGING_ENABLED", True)
 
@@ -181,6 +147,8 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_A_MAX_ENTRY_CENTS", "35")),
         "entry_window_minutes": float(os.getenv("STREAK_A_ENTRY_WINDOW_MINUTES", "3")),
         "contracts": float(os.getenv("STREAK_A_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_A_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_A_BANKROLL_PCT", "2.0")),
     },
     {
         "name": "B",
@@ -189,6 +157,8 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_B_MAX_ENTRY_CENTS", "40")),
         "entry_window_minutes": float(os.getenv("STREAK_B_ENTRY_WINDOW_MINUTES", "4")),
         "contracts": float(os.getenv("STREAK_B_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_B_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_B_BANKROLL_PCT", "2.0")),
     },
     {
         "name": "C",
@@ -197,6 +167,8 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_C_MAX_ENTRY_CENTS", "45")),
         "entry_window_minutes": float(os.getenv("STREAK_C_ENTRY_WINDOW_MINUTES", "5")),
         "contracts": float(os.getenv("STREAK_C_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_C_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_C_BANKROLL_PCT", "2.0")),
     },
     {
         "name": "D",
@@ -205,6 +177,8 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_D_MAX_ENTRY_CENTS", "27")),
         "entry_window_minutes": float(os.getenv("STREAK_D_ENTRY_WINDOW_MINUTES", "5")),
         "contracts": float(os.getenv("STREAK_D_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_D_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_D_BANKROLL_PCT", "2.0")),
     },
     {
         "name": "E",
@@ -213,6 +187,8 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_E_MAX_ENTRY_CENTS", "36")),
         "entry_window_minutes": float(os.getenv("STREAK_E_ENTRY_WINDOW_MINUTES", "2")),
         "contracts": float(os.getenv("STREAK_E_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_E_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_E_BANKROLL_PCT", "2.0")),
     },
 ]
 
@@ -229,15 +205,19 @@ for slot in STRATEGY_SLOTS:
         )
     if slot["contracts"] <= 0:
         raise RuntimeError(f'STREAK_{slot["name"]}_CONTRACTS must be > 0')
+    if slot["sizing_mode"] not in {"MANUAL", "PERCENT"}:
+        raise RuntimeError(
+            f'STREAK_{slot["name"]}_SIZING_MODE must be MANUAL or PERCENT'
+        )
+    if not 0 < slot["bankroll_pct"] <= 100:
+        raise RuntimeError(
+            f'STREAK_{slot["name"]}_BANKROLL_PCT must be > 0 and <= 100'
+        )
 
 # Multiple enabled slots may intentionally use the same streak length in paper mode
 # so different price/window hypotheses can be A/B tested on the same real market.
 # Demo/Live API mode intentionally places only the first matching slot per streak.
 
-if not 0 <= STOP_LOSS_CENTS <= 99:
-    raise RuntimeError("STOP_LOSS_CENTS must be between 0 and 99; use 0 to disable.")
-if not 1 <= SELL_EARLY_CENTS <= 100:
-    raise RuntimeError("SELL_EARLY_CENTS must be between 1 and 100; use 100 to disable.")
 
 # Persistent paper-trade log. If a Railway volume is attached, Railway supplies
 # RAILWAY_VOLUME_MOUNT_PATH automatically. Otherwise, fall back to ./data.
@@ -256,9 +236,13 @@ if MODE == "live":
             "KALSHI_PRIVATE_KEY are required for MODE=live."
         )
     for slot in STRATEGY_SLOTS:
-        if slot["enabled"] and float(slot["contracts"]) > LIVE_MAX_CONTRACTS:
+        if (
+            slot["enabled"]
+            and slot["sizing_mode"] == "MANUAL"
+            and float(slot["contracts"]) > LIVE_MAX_CONTRACTS
+        ):
             raise RuntimeError(
-                f"LIVE safety lock: SLOT {slot['name']} contracts={slot['contracts']:g} "
+                f"LIVE safety lock: SLOT {slot['name']} manual contracts={slot['contracts']:g} "
                 f"exceeds LIVE_MAX_CONTRACTS={LIVE_MAX_CONTRACTS:g}."
             )
 
@@ -979,54 +963,6 @@ def fetch_prepared_kalshi_close(prepared):
     return None, "", "", last_mid
 
 
-def diagnostic_probe_prepared_session(prepared):
-    print("*** ONE-MINUTE KALSHI LIVE DATA TEST ***", flush=True)
-    """
-    Probe Kalshi live-data for the currently prepared BTC session during the
-    session, without changing any trading state. This is diagnostic only.
-
-    It uses the same Kalshi-only endpoint chain as the exact-boundary capture,
-    so repeated 404s during the session tell us the failure is not boundary-only.
-    """
-    if not prepared:
-        return None
-
-    start_btc = prepared.get("start_btc")
-    milestones = prepared.get("milestones") or []
-    if not milestones:
-        milestones = [{"id": mid} for mid in (prepared.get("milestone_ids") or [])]
-
-    now = utc_now()
-    print(
-        f"LIVE TEST {now.isoformat(timespec='seconds')} "
-        f"ticker={prepared.get('ticker','?')} "
-        f"start={format_decimal(start_btc) or '?'} "
-        f"milestones={len(milestones)}"
-    )
-
-    found = None
-    for milestone in milestones:
-        price, source, path, milestone_id = fetch_live_data_for_milestone(
-            milestone, start_btc, context="one_minute_diagnostic"
-        )
-        if price is not None:
-            found = {
-                "price": price,
-                "source": source,
-                "path": path,
-                "milestone_id": milestone_id,
-            }
-            print(
-                f"LIVE BTC FOUND: id={milestone_id} "
-                f"value={format_decimal(price)} source={source} path={path}"
-            )
-            break
-
-    if found is None:
-        print("LIVE TEST RESULT: no usable Kalshi BTC live value found", flush=True)
-    print("*** ONE-MINUTE KALSHI LIVE DATA TEST COMPLETE ***", flush=True)
-    return found
-
 
 def capture_prepared_session(prepared):
     """
@@ -1546,6 +1482,146 @@ def get_recent_settled_markets():
     return markets
 
 
+
+def get_balance_snapshot():
+    """Read Kalshi balance fields without changing any account state."""
+    if MODE not in {"demo", "live"}:
+        return None
+    resp = authenticated_request("GET", "/portfolio/balance")
+    if resp.get("balance") is None:
+        raise RuntimeError("Kalshi balance response did not include 'balance'.")
+
+    balance_cents = int(resp["balance"])
+    balance_dollars_raw = resp.get("balance_dollars")
+    portfolio_value_raw = resp.get("portfolio_value")
+    updated_ts = resp.get("updated_ts")
+
+    # balance_dollars is a string dollar representation of balance. Check it
+    # against the integer-cent field when present so we catch any API/schema
+    # misunderstanding before it can affect sizing.
+    balance_dollars_cents = None
+    if balance_dollars_raw not in (None, ""):
+        try:
+            balance_dollars_cents = int(
+                (Decimal(str(balance_dollars_raw)) * Decimal("100")).quantize(Decimal("1"))
+            )
+        except (InvalidOperation, ValueError, TypeError):
+            balance_dollars_cents = None
+
+    return {
+        "balance_cents": balance_cents,
+        "balance_dollars": balance_dollars_raw,
+        "balance_dollars_cents": balance_dollars_cents,
+        "portfolio_value": portfolio_value_raw,
+        "updated_ts": updated_ts,
+    }
+
+
+def verify_kalshi_balance_snapshot():
+    """Print a read-only balance verification snapshot at startup."""
+    if not BALANCE_VERIFY_ON_START or MODE not in {"demo", "live"}:
+        return
+    snap = get_balance_snapshot()
+    balance_cents = snap["balance_cents"]
+    bd_cents = snap["balance_dollars_cents"]
+    consistency = (
+        "MATCH" if bd_cents is not None and abs(balance_cents - bd_cents) <= 1
+        else "UNAVAILABLE" if bd_cents is None
+        else "MISMATCH"
+    )
+    portfolio_value = snap["portfolio_value"]
+    portfolio_text = (
+        f"${int(portfolio_value)/100:.2f}" if portfolio_value is not None else "n/a"
+    )
+    print(
+        "KALSHI BALANCE VERIFY (READ ONLY): "
+        f"balance={balance_cents}c (${balance_cents/100:.2f}) "
+        f"balance_dollars={snap['balance_dollars']!r} "
+        f"field_check={consistency} "
+        f"portfolio_value={portfolio_value!r} ({portfolio_text}) "
+        f"updated_ts={snap['updated_ts']!r} "
+        "sizing_field=balance",
+        flush=True,
+    )
+    if consistency == "MISMATCH":
+        raise RuntimeError(
+            "Kalshi balance fields disagree; percent sizing disabled by startup verification failure."
+        )
+
+
+def get_available_balance_cents():
+    """Return the Kalshi balance field in cents for percent sizing."""
+    snap = get_balance_snapshot()
+    if snap is None:
+        return None
+    return int(snap["balance_cents"])
+
+
+def resolve_slot_contracts(slot, entry_cents):
+    """
+    Resolve order quantity at submission time.
+
+    MANUAL: use STREAK_X_CONTRACTS.
+    PERCENT: use current Kalshi available balance * BANKROLL_PCT, then FLOOR
+    to a whole number of contracts so the configured percentage is a true max.
+    LIVE_MAX_CONTRACTS remains an independent hard safety ceiling.
+    """
+    mode = slot.get("sizing_mode", "MANUAL")
+    manual = float(slot.get("contracts", 1))
+
+    if mode == "MANUAL":
+        qty = manual
+        print(
+            f"SIZING SLOT {slot['name']}: mode=MANUAL contracts={qty:g}",
+            flush=True,
+        )
+        return qty
+
+    if MODE == "paper":
+        # Percentage sizing needs a real account balance. Fail closed rather than
+        # silently inventing a paper bankroll.
+        raise RuntimeError(
+            f"SLOT {slot['name']} uses PERCENT sizing but MODE=paper has no Kalshi balance. "
+            "Use MANUAL sizing in paper mode."
+        )
+
+    balance_cents = get_available_balance_cents()
+    pct = float(slot.get("bankroll_pct", 0))
+    allocation_cents = balance_cents * pct / 100.0
+    raw_contracts = allocation_cents / float(entry_cents)
+    qty = int(raw_contracts // 1)
+
+    if qty < 1:
+        print(
+            f"SIZING SKIP SLOT {slot['name']}: mode=PERCENT "
+            f"balance=${balance_cents/100:.2f} pct={pct:g}% "
+            f"allocation=${allocation_cents/100:.2f} entry={entry_cents:g}c "
+            "supports 0 whole contracts.",
+            flush=True,
+        )
+        return 0
+
+    safety_cap = max(1, int(LIVE_MAX_CONTRACTS // 1)) if MODE == "live" else qty
+    if MODE == "live" and qty > safety_cap:
+        print(
+            f"SIZING SAFETY CAP SLOT {slot['name']}: calculated={qty} "
+            f"capped_to={safety_cap} by LIVE_MAX_CONTRACTS={LIVE_MAX_CONTRACTS:g}",
+            flush=True,
+        )
+        qty = safety_cap
+
+    actual_cost_cents = qty * float(entry_cents)
+    actual_pct = (actual_cost_cents / balance_cents * 100.0) if balance_cents > 0 else 0.0
+    print(
+        f"SIZING SLOT {slot['name']}: mode=PERCENT "
+        f"balance=${balance_cents/100:.2f} target={pct:g}% "
+        f"allocation=${allocation_cents/100:.2f} entry={entry_cents:g}c "
+        f"contracts={qty} actual_cost=${actual_cost_cents/100:.2f} "
+        f"actual_pct={actual_pct:.3f}%",
+        flush=True,
+    )
+    return float(qty)
+
 def get_open_markets():
     data = get_json("/markets", {"series_ticker": SERIES, "status": "open", "limit": 100})
     return data.get("markets", [])
@@ -1917,168 +1993,6 @@ def market_for_session_start(open_markets, session_start):
 
 
 
-def _strike_diag_market_snapshot(target_start):
-    """Return the exact KXBTC15M market for target_start from unopened/open catalogs."""
-    found = []
-    errors = []
-    for status in ("unopened", "open"):
-        try:
-            data = get_json("/markets", {
-                "series_ticker": SERIES,
-                "status": status,
-                "limit": 200,
-            })
-            for market in data.get("markets", []):
-                start = btc_session_start(market)
-                if start is not None and start == target_start:
-                    found.append((status, market))
-        except Exception as exc:
-            errors.append(f"{status}:{exc!r}")
-    if found:
-        # Prefer open if both catalogs briefly contain the market.
-        found.sort(key=lambda x: 1 if x[0] == "open" else 0, reverse=True)
-        return found[0][1], found[0][0], errors
-    return None, "", errors
-
-
-def strike_visibility_diagnostic_worker():
-    """
-    Diagnostic only. Watches one upcoming session across its boundary and logs:
-      * first time the exact ticker is visible
-      * first time its Kalshi strike is readable
-      * status/strike-field changes
-    It never mutates trading state or submits/cancels orders.
-    """
-    print(
-        f"STRIKE VISIBILITY DIAGNOSTIC=ON poll={STRIKE_VISIBILITY_POLL_SECONDS:g}s "
-        f"after_boundary={STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:g}s"
-    )
-    target = None
-    first_visible = None
-    first_strike = None
-    last_signature = None
-    last_heartbeat = 0.0
-    watcher_started = utc_now()
-
-    while True:
-        try:
-            now = utc_now()
-            if target is None:
-                base = current_15m_session_start(now)
-                target = base + dt.timedelta(minutes=15)
-                first_visible = None
-                first_strike = None
-                last_signature = None
-                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}", flush=True)
-
-            # Keep following the same target for a few minutes after boundary so
-            # we can measure delayed publication precisely.
-            seconds_from_boundary = (now - target).total_seconds()
-            if seconds_from_boundary > STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:
-                target = target + dt.timedelta(minutes=15)
-                first_visible = None
-                first_strike = None
-                last_signature = None
-                print(f"STRIKE WATCH ARMED: target_start={target.isoformat()}", flush=True)
-
-            market, catalog_status, errors = _strike_diag_market_snapshot(target)
-            now = utc_now()
-            rel = (now - target).total_seconds()
-
-            if errors and DEBUG_LIVE_DATA:
-                print(
-                    f"STRIKE WATCH API WARNING: target_start={target.isoformat()} "
-                    + " | ".join(errors)
-                )
-
-            if market is None:
-                # V6: heartbeat every 10 seconds so the watcher cannot be mistaken for dead.
-                if now.timestamp() - last_heartbeat >= 10:
-                    print(
-                        f"STRIKE WATCH HEARTBEAT: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s visible=NO strike=NO "
-                        f"watcher_uptime={(now-watcher_started).total_seconds():.1f}s",
-                        flush=True,
-                    )
-                    last_heartbeat = now.timestamp()
-            else:
-                if now.timestamp() - last_heartbeat >= 10:
-                    strike_hb, source_hb = extract_kalshi_start_btc(market)
-                    print(
-                        f"STRIKE WATCH HEARTBEAT: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s visible=YES ticker={market.get('ticker','?')} "
-                        f"status={market.get('status','?')} "
-                        f"strike={format_decimal(strike_hb) or 'NONE'} "
-                        f"source={source_hb or 'NONE'}",
-                        flush=True,
-                    )
-                    last_heartbeat = now.timestamp()
-                if first_visible is None:
-                    first_visible = now
-                    print(
-                        f"STRIKE TICKER FIRST VISIBLE: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
-                        f"catalog_status={catalog_status} market_status={market.get('status','?')}"
-                    )
-
-                strike, strike_source = extract_kalshi_start_btc(market)
-                raw_fields = {
-                    "floor_strike": market.get("floor_strike"),
-                    "cap_strike": market.get("cap_strike"),
-                    "functional_strike": market.get("functional_strike"),
-                    "custom_strike": market.get("custom_strike"),
-                    "yes_sub_title": market.get("yes_sub_title"),
-                    "subtitle": market.get("subtitle"),
-                    "title": market.get("title"),
-                }
-                signature = (
-                    market.get("ticker"), catalog_status, market.get("status"),
-                    format_decimal(strike), strike_source,
-                    json.dumps(raw_fields, sort_keys=True, default=str),
-                )
-                if signature != last_signature:
-                    print(
-                        f"STRIKE WATCH SNAPSHOT: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
-                        f"catalog_status={catalog_status} market_status={market.get('status','?')} "
-                        f"strike={format_decimal(strike) or '?'} source={strike_source or '?'} "
-                        f"fields={json.dumps(raw_fields, sort_keys=True, default=str)}"
-                    )
-                    last_signature = signature
-
-                if strike is not None and first_strike is None:
-                    first_strike = now
-                    visible_delay = (first_strike - first_visible).total_seconds() if first_visible else 0.0
-                    print(
-                        f"STRIKE FIRST READABLE: target_start={target.isoformat()} "
-                        f"t={rel:+.3f}s ticker={market.get('ticker','?')} "
-                        f"strike={format_decimal(strike)} source={strike_source} "
-                        f"after_ticker_visible={visible_delay:.3f}s"
-                    )
-
-            time.sleep(max(1.0, STRIKE_VISIBILITY_POLL_SECONDS))
-
-        except Exception as exc:
-            print(f"STRIKE VISIBILITY DIAGNOSTIC ERROR: {exc!r}")
-            time.sleep(max(2.0, STRIKE_VISIBILITY_POLL_SECONDS))
-
-
-def start_strike_visibility_diagnostic():
-    if not STRIKE_VISIBILITY_DIAGNOSTIC_ENABLED:
-        print("STRIKE VISIBILITY DIAGNOSTIC=OFF")
-        return
-    print(
-        f"STRIKE WATCH THREAD STARTING: poll={STRIKE_VISIBILITY_POLL_SECONDS:g}s "
-        f"after_boundary={STRIKE_VISIBILITY_AFTER_BOUNDARY_SECONDS:g}s",
-        flush=True,
-    )
-    thread = threading.Thread(
-        target=strike_visibility_diagnostic_worker,
-        daemon=True,
-        name="strike-visibility-diagnostic",
-    )
-    thread.start()
-    print(f"STRIKE WATCH THREAD STARTED: alive={thread.is_alive()}", flush=True)
 
 def preidentify_market_for_session_start(session_start):
     """Try to cache the exact next-session ticker before its session begins."""
@@ -2168,6 +2082,14 @@ def direct_submit_preidentified(pending):
     if not ticker:
         return "no_hint", None
 
+    slot_cfg = next((x for x in STRATEGY_SLOTS if x["name"] == pending["slot"]), None)
+    if slot_cfg is None:
+        raise RuntimeError(f"Unknown strategy slot {pending['slot']}")
+    contracts = resolve_slot_contracts(slot_cfg, pending["entry_cents"])
+    if contracts <= 0:
+        return "insufficient_bankroll", None
+    pending["contracts"] = contracts
+
     deadline = min(
         pending["expiration_ts"],
         utc_now().timestamp() + FAST_DIRECT_RETRY_MAX_SECONDS,
@@ -2187,7 +2109,7 @@ def direct_submit_preidentified(pending):
             pending["side"],
             pending["entry_cents"],
             pending["expiration_ts"],
-            pending["contracts"],
+            contracts,
         )
         if status == "accepted" and order:
             return "accepted", order
@@ -2800,8 +2722,7 @@ POSITION_PRICE_FIELDS = [
     "entry_cents",
     "bid_cents",
     "seconds_since_fill",
-    "stop_loss_setting_cents",
-    "sell_early_setting_cents",
+    "strategy_sell_early_cents",
 ]
 
 POSITION_SUMMARY_FIELDS = [
@@ -2884,8 +2805,7 @@ def exit_logging_worker(ticker):
                             "entry_cents": tracker["entry_cents"],
                             "bid_cents": bid,
                             "seconds_since_fill": elapsed,
-                            "stop_loss_setting_cents": STOP_LOSS_CENTS,
-                            "sell_early_setting_cents": SELL_EARLY_CENTS,
+                            "strategy_sell_early_cents": "",
                         },
                     )
 
@@ -2967,46 +2887,6 @@ def start_exit_logging(ticker, slot, side, entry_cents, contracts):
 
 
 
-def time_exit_thresholds(market):
-    """
-    Return (stop_loss_cents, take_profit_cents, minutes_remaining, band_name)
-    for the current 15-minute contract.
-    """
-    close_dt = parse_time(market.get("close_time"))
-    if close_dt is None:
-        return None, None, None, "unknown"
-
-    minutes_remaining = (close_dt - utc_now()).total_seconds() / 60.0
-
-    if minutes_remaining > 3:
-        return (
-            STOP_LOSS_GT3_CENTS,
-            TAKE_PROFIT_GT3_CENTS,
-            minutes_remaining,
-            ">3m",
-        )
-    if minutes_remaining > 2:
-        return (
-            STOP_LOSS_2_TO_3_CENTS,
-            TAKE_PROFIT_2_TO_3_CENTS,
-            minutes_remaining,
-            "2-3m",
-        )
-    if minutes_remaining > 1:
-        return (
-            STOP_LOSS_1_TO_2_CENTS,
-            TAKE_PROFIT_1_TO_2_CENTS,
-            minutes_remaining,
-            "1-2m",
-        )
-    return (
-        STOP_LOSS_LT1_CENTS,
-        TAKE_PROFIT_LT1_CENTS,
-        minutes_remaining,
-        "<1m",
-    )
-
-
 def side_bid_cents(market, held_side):
     """
     Executable value of the position: the best displayed bid for the exact
@@ -3070,7 +2950,7 @@ def strategy_exit_settings(position):
       S2: hold to settlement (no early sell, no stop loss)
       S3/S4/S5: sell early at configured target (default 96c)
       S6: hold to settlement by default (100c), pending more exit validation
-    No universal stop loss is used for these strategies.
+    There is no universal stop-loss or universal sell-early setting.
     """
     try:
         streak = int(position.get("trigger_streak", 0))
@@ -3098,8 +2978,7 @@ def position_exit_monitor_needed(position):
 
 def monitor_position_once(position):
     """
-    Check one filled position against the Railway-configured stop-loss and
-    early-sell thresholds. Returns:
+    Check one filled position against its streak-specific early-sell target. Returns:
       ("hold", position)
       ("closed", None)
       ("partial", updated_position)
@@ -3150,7 +3029,7 @@ def monitor_position_once(position):
     if not stop_hit and not early_hit:
         return "hold", position
 
-    reason = "STOP LOSS" if stop_hit else "SELL EARLY"
+    reason = "SELL EARLY"
     print(
         f"{reason} TRIGGERED: {ticker} {held_side.upper()} "
         f"bid={bid:.1f}c qty={qty:g}"
@@ -3187,7 +3066,7 @@ def monitor_position_once(position):
         f"trade_pnl={pnl_cents:.1f}c remaining={remaining:g}"
     )
 
-    reason_key = "stop_loss" if stop_hit else "sell_early"
+    reason_key = "sell_early"
     record_actual_exit(ticker, reason_key, exit_cents)
     performance_close_exit(ticker, reason_key, exit_cents)
 
@@ -3200,341 +3079,9 @@ def monitor_position_once(position):
 
 
 
-# -----------------------------------------------------------------------------
-# S2 CURRENT-MARKET OPEN-INTEREST TRANSITION DIAGNOSTIC -- NO TRADING-RULE CHANGES
-# -----------------------------------------------------------------------------
-_OI_WATCH_LOCK = threading.Lock()
-_OI_WATCHED_TICKERS = set()
-_OI_BASELINES = {}
-_OI_PRIOR_STATES = {}
-_OI_FIELDS = [
-    "target_start_utc", "ticker", "received_time_utc", "elapsed_seconds",
-    "source_time_utc", "open_interest_fp", "volume_fp", "price_dollars",
-    "yes_bid_dollars", "yes_ask_dollars",
-    "baseline_12_minute1_oi_median", "oi_ratio_to_baseline",
-    "prior_market_ticker", "prior_market_minute1_oi",
-    "prior_market_baseline_12_minute1_oi_median", "prior_market_oi_ratio",
-    "prior_oi_state", "current_oi_state", "oi_transition", "event",
-]
-
-
-def _oi_decimal(value):
-    try:
-        if value in (None, ""):
-            return None
-        return Decimal(str(value))
-    except Exception:
-        return None
-
-
-def _market_oi(market):
-    return _oi_decimal(market.get("open_interest_fp", market.get("open_interest")))
-
-
-def _median_decimal(values):
-    vals = sorted(v for v in values if v is not None)
-    if not vals:
-        return None
-    n = len(vals)
-    if n % 2:
-        return vals[n // 2]
-    return (vals[n // 2 - 1] + vals[n // 2]) / Decimal("2")
-
-
-def _oi_state(ratio):
-    if ratio is None:
-        return "UNKNOWN"
-    return "HIGH" if ratio >= OI_DIAGNOSTIC_HIGH_RATIO else "NORMAL"
-
-
-def _ensure_oi_log():
-    p = Path(OI_DIAGNOSTIC_LOG)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # V15 has a wider schema than V14. Start a fresh file if the existing header
-    # is from an older diagnostic so rows remain machine-readable.
-    expected = ",".join(_OI_FIELDS)
-    if p.exists() and p.stat().st_size:
-        try:
-            first = p.open("r", encoding="utf-8").readline().strip()
-            if first != expected:
-                backup = p.with_name(p.stem + "_pre_v15" + p.suffix)
-                p.replace(backup)
-                print(f"OI DIAGNOSTIC LOG ROTATED: old={backup}", flush=True)
-        except Exception:
-            pass
-    if not p.exists() or p.stat().st_size == 0:
-        with p.open("w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=_OI_FIELDS).writeheader()
-
-
-def _append_oi_log(row):
-    try:
-        _ensure_oi_log()
-        with Path(OI_DIAGNOSTIC_LOG).open("a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=_OI_FIELDS).writerow({k: row.get(k, "") for k in _OI_FIELDS})
-    except Exception as exc:
-        print(f"OI DIAGNOSTIC LOG WARNING: {exc!r}", flush=True)
-
-
-def _first_session_minute_oi(market):
-    """Return OI from the first 1-minute candle of this 15-minute BTC session.
-
-    KXBTC15M market objects can exist before their actual 15-minute observation
-    window, so session start is inferred as close_time - 15 minutes. The first
-    session candle ends one minute later (close_time - 14 minutes).
-    """
-    ticker = market.get("ticker") or ""
-    close_dt = parse_time(market.get("close_time"))
-    if not ticker or close_dt is None:
-        return None
-    first_end = close_dt - dt.timedelta(minutes=14)
-    ts = int(first_end.timestamp())
-    try:
-        data = get_json(
-            f"/series/{SERIES}/markets/{ticker}/candlesticks",
-            {"start_ts": ts, "end_ts": ts, "period_interval": 1},
-        )
-        candles = data.get("candlesticks") or []
-        if not candles:
-            return None
-        # Prefer an exact end timestamp; otherwise accept the closest returned row.
-        row = min(candles, key=lambda c: abs(int(c.get("end_period_ts", ts)) - ts))
-        return _oi_decimal(row.get("open_interest_fp", row.get("open_interest")))
-    except Exception as exc:
-        print(f"OI MINUTE1 WARNING: ticker={ticker} error={exc!r}", flush=True)
-        return None
-
-
-def _minute1_oi_context(target_start, exclude_ticker=None):
-    """Build apples-to-apples minute-1 OI context from the 13 prior markets.
-
-    Current-market baseline = median minute-1 OI of the immediately prior 12.
-    Prior-market ratio = prior market minute-1 OI / median minute-1 OI of the
-    12 markets before it. This lets V15 label NORMAL->HIGH transitions live.
-    """
-    data = get_json("/markets", {"series_ticker": SERIES, "limit": 1000})
-    candidates = []
-    for m in data.get("markets", []):
-        if exclude_ticker and m.get("ticker") == exclude_ticker:
-            continue
-        close_dt = parse_time(m.get("close_time"))
-        if close_dt is None or close_dt > target_start:
-            continue
-        candidates.append((close_dt, m))
-    candidates.sort(key=lambda x: x[0])
-    selected = candidates[-13:]
-    samples = []
-    for close_dt, m in selected:
-        oi = _first_session_minute_oi(m)
-        if oi is not None:
-            samples.append((close_dt, m.get("ticker") or "", oi))
-    if len(samples) < 13:
-        return None
-    samples.sort(key=lambda x: x[0])
-    prior = samples[-1]
-    prior_baseline = _median_decimal([x[2] for x in samples[-13:-1]])
-    current_baseline = _median_decimal([x[2] for x in samples[-12:]])
-    prior_ratio = (prior[2] / prior_baseline) if prior_baseline not in (None, Decimal("0")) else None
-    return {
-        "current_baseline": current_baseline,
-        "prior_ticker": prior[1],
-        "prior_oi": prior[2],
-        "prior_baseline": prior_baseline,
-        "prior_ratio": prior_ratio,
-        "prior_state": _oi_state(prior_ratio),
-        "samples": samples,
-    }
-
-
-def _oi_baseline_worker(ticker, target_start):
-    try:
-        ctx = _minute1_oi_context(target_start, exclude_ticker=ticker)
-    except Exception as exc:
-        print(f"OI BASELINE WARNING: {exc!r}", flush=True)
-        ctx = None
-    with _OI_WATCH_LOCK:
-        _OI_BASELINES[ticker] = ctx.get("current_baseline") if ctx else None
-        _OI_PRIOR_STATES[ticker] = ctx or {}
-    if not ctx or ctx.get("current_baseline") is None:
-        print(f"OI BASELINE UNAVAILABLE: ticker={ticker} target_start={target_start.isoformat()}", flush=True)
-        return
-    print(
-        f"OI BASELINE READY: ticker={ticker} basis=MINUTE1 lookback=12 "
-        f"median_minute1_oi={ctx['current_baseline']} prior_ticker={ctx['prior_ticker']} "
-        f"prior_minute1_oi={ctx['prior_oi']} prior_ratio="
-        f"{f'{ctx['prior_ratio']:.3f}x' if ctx['prior_ratio'] is not None else '?'} "
-        f"prior_state={ctx['prior_state']} high_cutoff={OI_DIAGNOSTIC_HIGH_RATIO}x",
-        flush=True,
-    )
-
-
-def _oi_context_snapshot(ticker, oi):
-    with _OI_WATCH_LOCK:
-        baseline = _OI_BASELINES.get(ticker)
-        prior = dict(_OI_PRIOR_STATES.get(ticker) or {})
-    ratio = (oi / baseline) if oi is not None and baseline not in (None, Decimal("0")) else None
-    current_state = _oi_state(ratio)
-    prior_state = prior.get("prior_state", "UNKNOWN")
-    transition = f"{prior_state}->{current_state}"
-    return baseline, ratio, prior, current_state, transition
-
-
-async def _oi_market_ticker_loop(ticker, target_start):
-    ws_url = cfbenchmarks_ws_url()
-    headers = websocket_auth_headers()
-    first_update = True
-    first_nonzero = True
-    deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_MAX_SECONDS)
-    print(f"OI WS CONNECTING: ticker={ticker}", flush=True)
-    async with websockets.connect(
-        ws_url,
-        additional_headers=headers,
-        ping_interval=20,
-        ping_timeout=20,
-        close_timeout=5,
-    ) as ws:
-        sub = {"id": 8101, "cmd": "subscribe", "params": {"channels": ["ticker"], "market_tickers": [ticker]}}
-        await ws.send(json.dumps(sub))
-        print(f"OI WS SUBSCRIBE SENT: ticker={ticker} channel=ticker", flush=True)
-        while utc_now() <= deadline:
-            timeout = max(0.05, min(2.0, (deadline - utc_now()).total_seconds()))
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            except asyncio.TimeoutError:
-                continue
-            data = json.loads(raw)
-            if data.get("type") == "subscribed":
-                print(f"OI WS SUBSCRIBED: ticker={ticker} {json.dumps(data, sort_keys=True)}", flush=True)
-                continue
-            if data.get("type") == "error":
-                print(f"OI WS ERROR: ticker={ticker} {json.dumps(data, sort_keys=True)}", flush=True)
-                continue
-            if data.get("type") != "ticker":
-                continue
-            msg = data.get("msg") or {}
-            if msg.get("market_ticker") != ticker:
-                continue
-            received = utc_now()
-            elapsed = (received - target_start).total_seconds()
-            oi = _oi_decimal(msg.get("open_interest_fp"))
-            vol = _oi_decimal(msg.get("volume_fp"))
-            baseline, ratio, prior, current_state, transition = _oi_context_snapshot(ticker, oi)
-            source_time = msg.get("time") or (str(msg.get("ts_ms")) if msg.get("ts_ms") is not None else "")
-            is_nonzero = oi is not None and oi > 0
-            if is_nonzero and first_nonzero:
-                event = "FIRST_NONZERO"
-            else:
-                event = "FIRST_UPDATE" if first_update else "UPDATE"
-            _append_oi_log({
-                "target_start_utc": target_start.isoformat(), "ticker": ticker,
-                "received_time_utc": received.isoformat(), "elapsed_seconds": f"{elapsed:.3f}",
-                "source_time_utc": source_time, "open_interest_fp": str(oi) if oi is not None else "",
-                "volume_fp": str(vol) if vol is not None else "", "price_dollars": msg.get("price_dollars", ""),
-                "yes_bid_dollars": msg.get("yes_bid_dollars", ""), "yes_ask_dollars": msg.get("yes_ask_dollars", ""),
-                "baseline_12_minute1_oi_median": str(baseline) if baseline is not None else "",
-                "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
-                "prior_market_ticker": prior.get("prior_ticker", ""),
-                "prior_market_minute1_oi": str(prior.get("prior_oi", "")),
-                "prior_market_baseline_12_minute1_oi_median": str(prior.get("prior_baseline", "")),
-                "prior_market_oi_ratio": f"{prior.get('prior_ratio'):.4f}" if prior.get("prior_ratio") is not None else "",
-                "prior_oi_state": prior.get("prior_state", "UNKNOWN"), "current_oi_state": current_state,
-                "oi_transition": transition, "event": event,
-            })
-            if first_update or elapsed <= 2.0 or int(max(0, elapsed)) in {5, 10, 15, 30, 60}:
-                print(
-                    f"OI {event}: ticker={ticker} t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
-                    f"baseline12_m1={baseline if baseline is not None else '?'} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
-                )
-            first_update = False
-            if is_nonzero and first_nonzero:
-                print(
-                    f"OI FIRST NONZERO: ticker={ticker} source=WS t={elapsed:+.3f}s oi={oi} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
-                )
-                first_nonzero = False
-    print(f"OI WS COMPLETE: ticker={ticker} window={OI_DIAGNOSTIC_MAX_SECONDS:g}s", flush=True)
-
-
-def _oi_ws_worker(ticker, target_start):
-    try:
-        asyncio.run(_oi_market_ticker_loop(ticker, target_start))
-    except Exception as exc:
-        print(f"OI WS FATAL: ticker={ticker} {exc!r}", flush=True)
-
-
-def _oi_fast_rest_probe_worker(ticker, target_start):
-    deadline = target_start + dt.timedelta(seconds=OI_DIAGNOSTIC_REST_PROBE_SECONDS)
-    attempt = 0
-    first_ok = True
-    first_nonzero = True
-    while utc_now() <= deadline:
-        attempt += 1
-        try:
-            market = get_market_by_ticker(ticker)
-            received = utc_now()
-            elapsed = (received - target_start).total_seconds()
-            oi = _market_oi(market)
-            vol = _oi_decimal(market.get("volume_fp", market.get("volume")))
-            baseline, ratio, prior, current_state, transition = _oi_context_snapshot(ticker, oi)
-            _append_oi_log({
-                "target_start_utc": target_start.isoformat(), "ticker": ticker,
-                "received_time_utc": received.isoformat(), "elapsed_seconds": f"{elapsed:.3f}",
-                "source_time_utc": market.get("updated_time", ""),
-                "open_interest_fp": str(oi) if oi is not None else "", "volume_fp": str(vol) if vol is not None else "",
-                "price_dollars": market.get("last_price_dollars", market.get("last_price", "")),
-                "yes_bid_dollars": market.get("yes_bid_dollars", ""), "yes_ask_dollars": market.get("yes_ask_dollars", ""),
-                "baseline_12_minute1_oi_median": str(baseline) if baseline is not None else "",
-                "oi_ratio_to_baseline": f"{ratio:.4f}" if ratio is not None else "",
-                "prior_market_ticker": prior.get("prior_ticker", ""), "prior_market_minute1_oi": str(prior.get("prior_oi", "")),
-                "prior_market_baseline_12_minute1_oi_median": str(prior.get("prior_baseline", "")),
-                "prior_market_oi_ratio": f"{prior.get('prior_ratio'):.4f}" if prior.get("prior_ratio") is not None else "",
-                "prior_oi_state": prior.get("prior_state", "UNKNOWN"), "current_oi_state": current_state,
-                "oi_transition": transition, "event": "REST_FIRST" if first_ok else "REST_PROBE",
-            })
-            if first_ok or elapsed <= 1.1:
-                print(
-                    f"OI REST {'FIRST' if first_ok else 'PROBE'}: ticker={ticker} attempt={attempt} "
-                    f"t={elapsed:+.3f}s oi={oi if oi is not None else '?'} "
-                    f"baseline12_m1={baseline if baseline is not None else '?'} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
-                )
-            if oi is not None and oi > 0 and first_nonzero:
-                print(
-                    f"OI FIRST NONZERO: ticker={ticker} source=REST t={elapsed:+.3f}s oi={oi} "
-                    f"ratio={f'{ratio:.3f}x' if ratio is not None else '?'} transition={transition}", flush=True,
-                )
-                first_nonzero = False
-            first_ok = False
-        except Exception as exc:
-            elapsed = (utc_now() - target_start).total_seconds()
-            if attempt <= 3:
-                print(f"OI REST NOT READY: ticker={ticker} attempt={attempt} t={elapsed:+.3f}s error={exc!r}", flush=True)
-        time.sleep(max(0.05, OI_DIAGNOSTIC_REST_PROBE_INTERVAL_SECONDS))
-
-
-def start_s2_oi_diagnostic(ticker, target_start, trigger_streak):
-    """Start non-blocking S2 OI transition collection once per market ticker."""
-    if not OI_DIAGNOSTIC_ENABLED or int(trigger_streak) != 2 or not ticker:
-        return
-    with _OI_WATCH_LOCK:
-        if ticker in _OI_WATCHED_TICKERS:
-            return
-        _OI_WATCHED_TICKERS.add(ticker)
-    print(
-        f"OI DIAGNOSTIC START: ticker={ticker} streak={trigger_streak} basis=MINUTE1 "
-        f"lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} high_cutoff={OI_DIAGNOSTIC_HIGH_RATIO}x "
-        f"max_seconds={OI_DIAGNOSTIC_MAX_SECONDS:g} TRADING_RULES_UNCHANGED", flush=True,
-    )
-    # Build the historical minute-1 context first in its own thread. WS/REST start
-    # immediately as separate threads; early rows may say UNKNOWN until baseline is ready.
-    threading.Thread(target=_oi_baseline_worker, args=(ticker, target_start), daemon=True, name=f"oi-baseline-{ticker}").start()
-    threading.Thread(target=_oi_ws_worker, args=(ticker, target_start), daemon=True, name=f"oi-ws-{ticker}").start()
-    threading.Thread(target=_oi_fast_rest_probe_worker, args=(ticker, target_start), daemon=True, name=f"oi-rest-{ticker}").start()
-
 
 # -----------------------------------------------------------------------------
-# CF BENCHMARKS BRTI WEBSOCKET DIAGNOSTIC -- NO TRADING-RULE CHANGES
+# CF BENCHMARKS BRTI WEBSOCKET FEED -- LIVE BOUNDARY TRIGGER
 # -----------------------------------------------------------------------------
 _CFB_STATE_LOCK = threading.Lock()
 _CFB_STATE = {
@@ -3611,7 +3158,7 @@ def _cfb_boundary_delta_from_source_ms(source_ms):
 
 async def cfbenchmarks_diagnostic_loop():
     ws_url = cfbenchmarks_ws_url()
-    while CFBENCHMARKS_DIAGNOSTIC_ENABLED:
+    while CFBENCHMARKS_FEED_ENABLED:
         try:
             headers = websocket_auth_headers()
             print(
@@ -3850,11 +3397,11 @@ def cfbenchmarks_thread_worker():
 
 
 def start_cfbenchmarks_diagnostic_thread():
-    if not CFBENCHMARKS_DIAGNOSTIC_ENABLED:
-        print("CFBENCHMARKS DIAGNOSTIC=OFF")
+    if not CFBENCHMARKS_FEED_ENABLED:
+        print("CFBENCHMARKS BRTI FEED=OFF")
         return None
     print(
-        f"CFBENCHMARKS DIAGNOSTIC=ON index={CFBENCHMARKS_INDEX_ID} "
+        f"CFBENCHMARKS BRTI FEED=ON index={CFBENCHMARKS_INDEX_ID} "
         f"reconnect={CFBENCHMARKS_RECONNECT_SECONDS:g}s"
     )
     thread = threading.Thread(
@@ -3868,7 +3415,7 @@ def start_cfbenchmarks_diagnostic_thread():
 
 def main():
     print(f"BUILD VERSION={BUILD_VERSION}", flush=True)
-    print("*** THIS BUILD MUST PRINT ONE-MINUTE LIVE-DATA PROBE HEARTBEATS ***", flush=True)
+    verify_kalshi_balance_snapshot()
     ensure_trade_log()
     ensure_session_log()
     start_cfbenchmarks_diagnostic_thread()
@@ -3877,15 +3424,7 @@ def main():
         f"EXITS CONFIG: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
         f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
         f"S6={S6_SELL_EARLY_CENTS:g}c "
-        "(100c=HOLD) STOP_LOSS=OFF",
-        flush=True,
-    )
-    print(
-        f"OI DIAGNOSTIC={'ON' if OI_DIAGNOSTIC_ENABLED else 'OFF'} "
-        f"streak=S2 lookback={OI_DIAGNOSTIC_LOOKBACK_MARKETS} "
-        f"window={OI_DIAGNOSTIC_MAX_SECONDS:g}s fast_rest={OI_DIAGNOSTIC_REST_PROBE_SECONDS:g}s "
-        f"log={OI_DIAGNOSTIC_LOG} "
-        "TRADING_RULES_UNCHANGED",
+        "(100c=HOLD; streak-specific exits only)",
         flush=True,
     )
 
@@ -3916,7 +3455,9 @@ def main():
             f"SLOT {slot['name']}={state} streak={slot['streak']} "
             f"max_entry={slot['max_entry_cents']}c "
             f"window={slot['entry_window_minutes']:g}m "
-            f"contracts={slot['contracts']:g}"
+            f"sizing={slot['sizing_mode']} "
+            f"manual_contracts={slot['contracts']:g} "
+            f"bankroll_pct={slot['bankroll_pct']:g}%"
         )
     print(
         f"S2 MOVE FILTER={'ON' if S2_MOVE_FILTER_ENABLED else 'OFF'} "
@@ -3934,14 +3475,9 @@ def main():
     print("OFFICIAL RESULT=not used")
     print("EXTERNAL BTC SOURCES=not used")
     print(
-        f"LIVE DATA DIAGNOSTIC={'ON' if LIVE_DATA_DIAGNOSTIC_ENABLED else 'OFF'} "
-        f"interval={LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS:g}s "
-        f"boundary_guard={LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS:g}s"
-    )
-    print(
         f"EXITS: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
         f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
-        f"S6={S6_SELL_EARLY_CENTS:g}c STOP_LOSS=OFF "
+        f"S6={S6_SELL_EARLY_CENTS:g}c "
         f"POSITION_POLL={POLL_POSITION_SECONDS:g}s"
     )
     print(f"TRADE LOG={TRADE_LOG}")
@@ -3949,13 +3485,6 @@ def main():
     print(
         f"EXIT LOGGING={'ON' if EXIT_LOGGING_ENABLED else 'OFF'} "
         f"poll={EXIT_LOG_POLL_SECONDS:g}s"
-    )
-    print(
-        f"TIME EXITS={'ON' if TIME_EXIT_ENABLED else 'OFF'} | "
-        f">3m stop/take={STOP_LOSS_GT3_CENTS:g}/{TAKE_PROFIT_GT3_CENTS:g}c | "
-        f"2-3m={STOP_LOSS_2_TO_3_CENTS:g}/{TAKE_PROFIT_2_TO_3_CENTS:g}c | "
-        f"1-2m={STOP_LOSS_1_TO_2_CENTS:g}/{TAKE_PROFIT_1_TO_2_CENTS:g}c | "
-        f"<1m={STOP_LOSS_LT1_CENTS:g}/{TAKE_PROFIT_LT1_CENTS:g}c"
     )
     print(f"POSITION PRICE LOG={POSITION_PRICE_LOG}")
     print(f"POSITION SUMMARY LOG={POSITION_SUMMARY_LOG}")
@@ -3985,10 +3514,8 @@ def main():
     last_sequence_ticker = None
     prepared_fast_session = None
     preidentified_next_market = None
-    next_live_data_diagnostic_ts = 0.0
 
     print_current_strategy_summary()
-    start_strike_visibility_diagnostic()
 
     while True:
         try:
@@ -4012,21 +3539,6 @@ def main():
                         or btc_session_start(preidentified_next_market) != target
                     ):
                         preidentified_next_market = preidentify_market_for_session_start(target)
-
-                    # Diagnostic-only one-minute live-data probe. Avoid the final
-                    # few seconds before a boundary so it cannot compete with the
-                    # exact-boundary capture request.
-                    if LIVE_DATA_DIAGNOSTIC_ENABLED:
-                        _now_ts = utc_now().timestamp()
-                        _seconds_to_close = (target - utc_now()).total_seconds() if target else 9999
-                        if (
-                            _now_ts >= next_live_data_diagnostic_ts
-                            and _seconds_to_close > LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS
-                        ):
-                            diagnostic_probe_prepared_session(prepared_fast_session)
-                            next_live_data_diagnostic_ts = (
-                                utc_now().timestamp() + LIVE_DATA_DIAGNOSTIC_INTERVAL_SECONDS
-                            )
 
                     captured, prepared_fast_session = capture_prepared_from_cfb_if_due(
                         prepared_fast_session
@@ -4428,7 +3940,7 @@ def main():
                             side = pending_api_signal["side"]
                             slot_name = pending_api_signal["slot"]
                             limit_cents = pending_api_signal["entry_cents"]
-                            contracts = pending_api_signal["contracts"]
+                            contracts = pending_api_signal.get("contracts", pending_api_signal.get("manual_contracts", 1))
                             expiration_ts = pending_api_signal["expiration_ts"]
                             trigger_result = pending_api_signal["trigger_result"]
                             trigger_streak = pending_api_signal["trigger_streak"]
@@ -4463,6 +3975,14 @@ def main():
                             )
                             time.sleep(POLL_ORDER_SECONDS)
                             continue
+                        if status == "insufficient_bankroll":
+                            print(
+                                f"SIGNAL LOCK SKIP SLOT {pending_api_signal['slot']}: "
+                                "insufficient available balance for 1 whole contract."
+                            )
+                            pending_api_signal = None
+                            sleep_idle()
+                            continue
                         if status == "not_ready":
                             print(
                                 f"FAST DIRECT TICKER NOT READY: {ticker_hint}; "
@@ -4485,11 +4005,6 @@ def main():
                         continue
 
                     ticker = market["ticker"]
-                    start_s2_oi_diagnostic(
-                        ticker,
-                        pending_api_signal["target_start"],
-                        pending_api_signal["trigger_streak"],
-                    )
                     age = market_age_minutes(market)
                     latency_mark(
                         "MARKET_VISIBLE",
@@ -4499,7 +4014,16 @@ def main():
                     side = pending_api_signal["side"]
                     slot_name = pending_api_signal["slot"]
                     limit_cents = pending_api_signal["entry_cents"]
-                    contracts = pending_api_signal["contracts"]
+                    slot_cfg = next((x for x in STRATEGY_SLOTS if x["name"] == slot_name), None)
+                    if slot_cfg is None:
+                        raise RuntimeError(f"Unknown strategy slot {slot_name}")
+                    contracts = resolve_slot_contracts(slot_cfg, limit_cents)
+                    if contracts <= 0:
+                        print(f"SIGNAL LOCK SKIP SLOT {slot_name}: insufficient bankroll for 1 whole contract.")
+                        pending_api_signal = None
+                        sleep_idle()
+                        continue
+                    pending_api_signal["contracts"] = contracts
                     expiration_ts = pending_api_signal["expiration_ts"]
                     trigger_result = pending_api_signal["trigger_result"]
                     trigger_streak = pending_api_signal["trigger_streak"]
@@ -4675,7 +4199,6 @@ def main():
             )
 
             entry_window = strategy["entry_window_minutes"]
-            contracts = strategy["contracts"]
             limit_cents = strategy["max_entry_cents"]
             slot_name = strategy["name"]
 
@@ -4700,7 +4223,9 @@ def main():
                 "trigger_streak": streak,
                 "side": side,
                 "entry_cents": float(limit_cents),
-                "contracts": float(contracts),
+                "manual_contracts": float(strategy["contracts"]),
+                "sizing_mode": strategy["sizing_mode"],
+                "bankroll_pct": float(strategy["bankroll_pct"]),
                 "target_start": target_start,
                 "expiration_ts": expiration_ts,
                 "ticker_hint": (
@@ -4710,12 +4235,6 @@ def main():
                     else None
                 ),
             }
-            if pending_api_signal.get("ticker_hint"):
-                start_s2_oi_diagnostic(
-                    pending_api_signal["ticker_hint"],
-                    pending_api_signal["target_start"],
-                    pending_api_signal["trigger_streak"],
-                )
 
             latency_mark(
                 "SIGNAL_LOCKED",
