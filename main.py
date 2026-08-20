@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_S3SPIKE150_EXITCFG_OITIMING_DUPGUARD_V18_2026-08-19"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_OITIMING_DUPGUARD_V19_2026-08-19"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -89,6 +89,7 @@ S2_SELL_EARLY_CENTS = float(os.getenv("S2_SELL_EARLY_CENTS", "100"))
 S3_SELL_EARLY_CENTS = float(os.getenv("S3_SELL_EARLY_CENTS", "96"))
 S4_SELL_EARLY_CENTS = float(os.getenv("S4_SELL_EARLY_CENTS", "96"))
 S5_SELL_EARLY_CENTS = float(os.getenv("S5_SELL_EARLY_CENTS", "96"))
+S6_SELL_EARLY_CENTS = float(os.getenv("S6_SELL_EARLY_CENTS", "100"))
 
 # S2 current-market open-interest diagnostic. Diagnostic only: never blocks, delays,
 # cancels, or modifies an order. It records the earliest Kalshi market_ticker OI
@@ -204,6 +205,14 @@ STRATEGY_SLOTS = [
         "max_entry_cents": int(os.getenv("STREAK_D_MAX_ENTRY_CENTS", "27")),
         "entry_window_minutes": float(os.getenv("STREAK_D_ENTRY_WINDOW_MINUTES", "5")),
         "contracts": float(os.getenv("STREAK_D_CONTRACTS", "1")),
+    },
+    {
+        "name": "E",
+        "enabled": env_bool("STREAK_E_ENABLED", True),
+        "streak": int(os.getenv("STREAK_E_LENGTH", "6")),
+        "max_entry_cents": int(os.getenv("STREAK_E_MAX_ENTRY_CENTS", "36")),
+        "entry_window_minutes": float(os.getenv("STREAK_E_ENTRY_WINDOW_MINUTES", "2")),
+        "contracts": float(os.getenv("STREAK_E_CONTRACTS", "1")),
     },
 ]
 
@@ -1832,7 +1841,7 @@ def print_current_strategy_summary(rows=None):
         f"avg_pnl_per_trade={avg}"
     )
 
-    for slot in ("A", "B", "C", "D"):
+    for slot in tuple(item["name"] for item in STRATEGY_SLOTS):
         slot_rows = [r for r in rows if r.get("slot") == slot]
         if not slot_rows:
             continue
@@ -3059,7 +3068,8 @@ def strategy_exit_settings(position):
     """
     Simple streak-specific live exit rule:
       S2: hold to settlement (no early sell, no stop loss)
-      S3/S4/S5: sell early at 96c if an executable bid reaches 96c
+      S3/S4/S5: sell early at configured target (default 96c)
+      S6: hold to settlement by default (100c), pending more exit validation
     No universal stop loss is used for these strategies.
     """
     try:
@@ -3072,6 +3082,7 @@ def strategy_exit_settings(position):
         3: S3_SELL_EARLY_CENTS,
         4: S4_SELL_EARLY_CENTS,
         5: S5_SELL_EARLY_CENTS,
+        6: S6_SELL_EARLY_CENTS,
     }
     early_target = float(targets.get(streak, 100.0))
     if not 1 <= early_target <= 100:
@@ -3865,6 +3876,7 @@ def main():
     print(
         f"EXITS CONFIG: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
         f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
+        f"S6={S6_SELL_EARLY_CENTS:g}c "
         "(100c=HOLD) STOP_LOSS=OFF",
         flush=True,
     )
@@ -3927,7 +3939,9 @@ def main():
         f"boundary_guard={LIVE_DATA_DIAGNOSTIC_BOUNDARY_GUARD_SECONDS:g}s"
     )
     print(
-        "EXITS: S2=HOLD S3=96c S4=96c S5=96c STOP_LOSS=OFF "
+        f"EXITS: S2={S2_SELL_EARLY_CENTS:g}c S3={S3_SELL_EARLY_CENTS:g}c "
+        f"S4={S4_SELL_EARLY_CENTS:g}c S5={S5_SELL_EARLY_CENTS:g}c "
+        f"S6={S6_SELL_EARLY_CENTS:g}c STOP_LOSS=OFF "
         f"POSITION_POLL={POLL_POSITION_SECONDS:g}s"
     )
     print(f"TRADE LOG={TRADE_LOG}")
