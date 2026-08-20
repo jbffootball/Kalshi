@@ -18,7 +18,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_EXITCFG_OITIMING_DUPGUARD_V17_2026-08-19"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_4SLOT_S2MOVE30_S3SPIKE150_EXITCFG_OITIMING_DUPGUARD_V18_2026-08-19"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -157,6 +157,20 @@ S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS = Decimal(
 )
 if S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS < 0:
     raise RuntimeError("S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS must be >= 0")
+
+# S3 short-term spike filter. Historical two-block validation showed that S3
+# reversals deteriorated sharply when BTC had already moved at least $150 in
+# absolute terms over the immediately preceding 30 minutes. The live measure
+# is apples-to-apples with that historical definition: start price of the
+# second-most-recent completed 15m session to the boundary close of the most
+# recent completed session. Only S3 is affected. Fail closed if prices are
+# unavailable.
+S3_SPIKE_FILTER_ENABLED = env_bool("S3_SPIKE_FILTER_ENABLED", True)
+S3_MAX_PRIOR_30M_MOVE_DOLLARS = Decimal(
+    os.getenv("S3_MAX_PRIOR_30M_MOVE_DOLLARS", "150")
+)
+if S3_MAX_PRIOR_30M_MOVE_DOLLARS < 0:
+    raise RuntimeError("S3_MAX_PRIOR_30M_MOVE_DOLLARS must be >= 0")
 
 STRATEGY_SLOTS = [
     {
@@ -1599,6 +1613,36 @@ def s2_move_filter(markets, streak):
         f"total_move=${format_decimal(total_move, 2)} "
         f"avg_per_session=${format_decimal(avg_move, 2)} "
         f"minimum=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS, 2)}"
+    )
+    return passes, detail
+
+
+def s3_30m_spike_filter(markets, streak):
+    """Return (passes, detail) for the S3 prior-30-minute spike filter.
+
+    For an S3 setup immediately after a boundary, measure the absolute BTC
+    move from the start of the second-most-recent completed 15-minute session
+    to the boundary close of the most recent completed session. This is the
+    immediately preceding 30-minute underlying move. Skip S3 when the move is
+    greater than or equal to the configured threshold. Other streak lengths
+    pass unchanged.
+    """
+    if not S3_SPIKE_FILTER_ENABLED or streak != 3:
+        return True, "not_applicable"
+
+    if len(markets) < 2:
+        return False, "insufficient_session_history"
+
+    start_price = decimal_or_none(markets[-2].get("kalshi_start_btc"))
+    close_price = decimal_or_none(markets[-1].get("kalshi_close_btc"))
+    if start_price is None or close_price is None:
+        return False, "missing_kalshi_btc_price"
+
+    move_30m = abs(close_price - start_price)
+    passes = move_30m < S3_MAX_PRIOR_30M_MOVE_DOLLARS
+    detail = (
+        f"prior_30m_move=${format_decimal(move_30m, 2)} "
+        f"skip_at_or_above=${format_decimal(S3_MAX_PRIOR_30M_MOVE_DOLLARS, 2)}"
     )
     return passes, detail
 
@@ -3867,6 +3911,10 @@ def main():
         f"minimum_avg_per_session=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS, 2)} "
         f"minimum_total_for_S2=${format_decimal(S2_MIN_AVG_MOVE_PER_SESSION_DOLLARS * Decimal('2'), 2)}"
     )
+    print(
+        f"S3 30M SPIKE FILTER={'ON' if S3_SPIKE_FILTER_ENABLED else 'OFF'} "
+        f"skip_at_or_above=${format_decimal(S3_MAX_PRIOR_30M_MOVE_DOLLARS, 2)}"
+    )
     print("OUTCOME METHOD=Kalshi CF Benchmarks BRTI final 60-second quarter-hour average; successive strikes retained for verification")
     print("FAST BOUNDARY=ON; BRTI window_size=60 is the live trigger; no wait for next formal strike")
     print("SESSION CLOCK=close_time - 15 minutes")
@@ -4084,7 +4132,17 @@ def main():
                     else:
                         if streak == 2 and S2_MOVE_FILTER_ENABLED:
                             print(f"S2 MOVE FILTER PASS (PAPER): {s2_detail}")
-                        matches = strategies_for_streak(streak)
+                        s3_ok, s3_detail = s3_30m_spike_filter(immediate_markets, streak)
+                        if not s3_ok:
+                            print(
+                                f"S3 30M SPIKE FILTER SKIP (PAPER): streak={streak} "
+                                f"{s3_detail}; no paper order."
+                            )
+                            matches = []
+                        else:
+                            if streak == 3 and S3_SPIKE_FILTER_ENABLED:
+                                print(f"S3 30M SPIKE FILTER PASS (PAPER): {s3_detail}")
+                            matches = strategies_for_streak(streak)
                     if not matches:
                         print(f"NO SLOT MATCH/FILTERED: streak={streak}; no paper orders.")
                     else:
@@ -4563,6 +4621,27 @@ def main():
                     "S2_MOVE_FILTER_PASS",
                     boundary_dt=target_start,
                     detail=s2_detail,
+                )
+
+            s3_ok, s3_detail = s3_30m_spike_filter(decision_markets, streak)
+            if not s3_ok:
+                print(
+                    f"S3 30M SPIKE FILTER SKIP: streak={streak} {s3_detail}; "
+                    "no live order."
+                )
+                latency_mark(
+                    "S3_30M_SPIKE_FILTER_SKIP",
+                    boundary_dt=target_start,
+                    detail=s3_detail,
+                )
+                sleep_idle()
+                continue
+            if streak == 3 and S3_SPIKE_FILTER_ENABLED:
+                print(f"S3 30M SPIKE FILTER PASS: {s3_detail}")
+                latency_mark(
+                    "S3_30M_SPIKE_FILTER_PASS",
+                    boundary_dt=target_start,
+                    detail=s3_detail,
                 )
 
             strategy = strategy_for_streak(streak)
