@@ -9,6 +9,7 @@ import json
 import re
 import datetime as dt
 import asyncio
+from zoneinfo import ZoneInfo
 
 import websockets
 from urllib.parse import urlparse
@@ -26,7 +27,7 @@ def env_bool(name, default=False):
         return bool(default)
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_DYNSIZE_BALVERIFY_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_DUPGUARD_V20_1_2026-08-20"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_DYNSIZE_DAYTIMEFILTER_BALVERIFY_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_DUPGUARD_V21_2026-08-22"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -138,6 +139,50 @@ S3_MAX_PRIOR_30M_MOVE_DOLLARS = Decimal(
 )
 if S3_MAX_PRIOR_30M_MOVE_DOLLARS < 0:
     raise RuntimeError("S3_MAX_PRIOR_30M_MOVE_DOLLARS must be >= 0")
+
+# Day/time quality filter based on the historical day x 4-hour analysis.
+# These are deliberately narrow Central Time exclusions, not broad day or
+# time-of-day exclusions. America/Chicago makes the rule DST-aware.
+DAY_TIME_FILTER_ENABLED = env_bool("DAY_TIME_FILTER_ENABLED", True)
+DAY_TIME_FILTER_TZ_NAME = "America/Chicago"
+DAY_TIME_FILTER_TZ = ZoneInfo(DAY_TIME_FILTER_TZ_NAME)
+
+# weekday(): Monday=0 ... Sunday=6
+DAY_TIME_BLOCKED_WINDOWS = (
+    (1, 0, 4, "Tuesday 12AM-4AM CT"),
+    (1, 8, 12, "Tuesday 8AM-12PM CT"),
+    (2, 20, 24, "Wednesday 8PM-12AM CT"),
+    (4, 12, 16, "Friday 12PM-4PM CT"),
+)
+
+
+def day_time_filter(session_start_utc):
+    """Return (allowed, detail) for the new market's session start."""
+    if not DAY_TIME_FILTER_ENABLED:
+        return True, "disabled"
+
+    if session_start_utc is None:
+        return False, "session_start_unavailable"
+
+    if session_start_utc.tzinfo is None:
+        session_start_utc = session_start_utc.replace(tzinfo=dt.timezone.utc)
+
+    local_dt = session_start_utc.astimezone(DAY_TIME_FILTER_TZ)
+    weekday = local_dt.weekday()
+    hour = local_dt.hour
+
+    for blocked_weekday, start_hour, end_hour, label in DAY_TIME_BLOCKED_WINDOWS:
+        if weekday == blocked_weekday and start_hour <= hour < end_hour:
+            return (
+                False,
+                f"{label} local={local_dt.isoformat()} tz={DAY_TIME_FILTER_TZ_NAME}",
+            )
+
+    return (
+        True,
+        f"allowed local={local_dt.isoformat()} tz={DAY_TIME_FILTER_TZ_NAME}",
+    )
+
 
 STRATEGY_SLOTS = [
     {
@@ -3468,6 +3513,11 @@ def main():
         f"S3 30M SPIKE FILTER={'ON' if S3_SPIKE_FILTER_ENABLED else 'OFF'} "
         f"skip_at_or_above=${format_decimal(S3_MAX_PRIOR_30M_MOVE_DOLLARS, 2)}"
     )
+    print(
+        f"DAY/TIME FILTER={'ON' if DAY_TIME_FILTER_ENABLED else 'OFF'} "
+        f"timezone={DAY_TIME_FILTER_TZ_NAME} "
+        "blocked=Tue00-04,Tue08-12,Wed20-24,Fri12-16"
+    )
     print("OUTCOME METHOD=Kalshi CF Benchmarks BRTI final 60-second quarter-hour average; successive strikes retained for verification")
     print("FAST BOUNDARY=ON; BRTI window_size=60 is the live trigger; no wait for next formal strike")
     print("SESSION CLOCK=close_time - 15 minutes")
@@ -3648,27 +3698,39 @@ def main():
                         f"latest_derived_close={latest_close}; no new entry yet."
                     )
                 elif last_result in {"yes", "no"}:
-                    s2_ok, s2_detail = s2_move_filter(immediate_markets, streak)
-                    if not s2_ok:
+                    day_time_ok, day_time_detail = day_time_filter(paper_target_start)
+                    if not day_time_ok:
                         print(
-                            f"S2 MOVE FILTER SKIP (PAPER): streak={streak} {s2_detail}; "
+                            f"DAY/TIME FILTER SKIP (PAPER): {day_time_detail}; "
                             "no paper order."
                         )
                         matches = []
                     else:
-                        if streak == 2 and S2_MOVE_FILTER_ENABLED:
-                            print(f"S2 MOVE FILTER PASS (PAPER): {s2_detail}")
-                        s3_ok, s3_detail = s3_30m_spike_filter(immediate_markets, streak)
-                        if not s3_ok:
+                        if DAY_TIME_FILTER_ENABLED:
+                            print(f"DAY/TIME FILTER PASS (PAPER): {day_time_detail}")
+
+                        s2_ok, s2_detail = s2_move_filter(immediate_markets, streak)
+                        if not s2_ok:
                             print(
-                                f"S3 30M SPIKE FILTER SKIP (PAPER): streak={streak} "
-                                f"{s3_detail}; no paper order."
+                                f"S2 MOVE FILTER SKIP (PAPER): streak={streak} {s2_detail}; "
+                                "no paper order."
                             )
                             matches = []
                         else:
-                            if streak == 3 and S3_SPIKE_FILTER_ENABLED:
-                                print(f"S3 30M SPIKE FILTER PASS (PAPER): {s3_detail}")
-                            matches = strategies_for_streak(streak)
+                            if streak == 2 and S2_MOVE_FILTER_ENABLED:
+                                print(f"S2 MOVE FILTER PASS (PAPER): {s2_detail}")
+
+                            s3_ok, s3_detail = s3_30m_spike_filter(immediate_markets, streak)
+                            if not s3_ok:
+                                print(
+                                    f"S3 30M SPIKE FILTER SKIP (PAPER): streak={streak} "
+                                    f"{s3_detail}; no paper order."
+                                )
+                                matches = []
+                            else:
+                                if streak == 3 and S3_SPIKE_FILTER_ENABLED:
+                                    print(f"S3 30M SPIKE FILTER PASS (PAPER): {s3_detail}")
+                                matches = strategies_for_streak(streak)
                     if not matches:
                         print(f"NO SLOT MATCH/FILTERED: streak={streak}; no paper orders.")
                     else:
@@ -4140,6 +4202,27 @@ def main():
             if last_result not in {"yes", "no"}:
                 sleep_idle()
                 continue
+
+            day_time_ok, day_time_detail = day_time_filter(target_start)
+            if not day_time_ok:
+                print(
+                    f"DAY/TIME FILTER SKIP: {day_time_detail}; no live order."
+                )
+                latency_mark(
+                    "DAY_TIME_FILTER_SKIP",
+                    boundary_dt=target_start,
+                    detail=day_time_detail,
+                )
+                sleep_idle()
+                continue
+
+            if DAY_TIME_FILTER_ENABLED:
+                print(f"DAY/TIME FILTER PASS: {day_time_detail}")
+                latency_mark(
+                    "DAY_TIME_FILTER_PASS",
+                    boundary_dt=target_start,
+                    detail=day_time_detail,
+                )
 
             s2_ok, s2_detail = s2_move_filter(decision_markets, streak)
             if not s2_ok:
