@@ -27,7 +27,7 @@ def env_bool(name, default=False):
         return bool(default)
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_5SLOT_DYNSIZE_DAYTIMEFILTER_BALVERIFY_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_DUPGUARD_V21_2026-08-22"
+BUILD_VERSION = "CFBENCHMARKS_BRTI_LIVE_TRIGGER_6SLOT_S1CONT23X1_DYNSIZE_DAYTIMEFILTER_BALVERIFY_S2MOVE30_S3SPIKE150_S6_36X2_EXITCFG_DUPGUARD_V22_2026-08-22"
 
 MODE = os.getenv("MODE", "paper").strip().lower()
 if MODE not in {"paper", "demo", "live"}:
@@ -187,6 +187,7 @@ def day_time_filter(session_start_utc):
 STRATEGY_SLOTS = [
     {
         "name": "A",
+        "direction": "REVERSAL",
         "enabled": env_bool("STREAK_A_ENABLED", True),
         "streak": int(os.getenv("STREAK_A_LENGTH", "2")),
         "max_entry_cents": int(os.getenv("STREAK_A_MAX_ENTRY_CENTS", "35")),
@@ -197,6 +198,7 @@ STRATEGY_SLOTS = [
     },
     {
         "name": "B",
+        "direction": "REVERSAL",
         "enabled": env_bool("STREAK_B_ENABLED", True),
         "streak": int(os.getenv("STREAK_B_LENGTH", "3")),
         "max_entry_cents": int(os.getenv("STREAK_B_MAX_ENTRY_CENTS", "40")),
@@ -207,6 +209,7 @@ STRATEGY_SLOTS = [
     },
     {
         "name": "C",
+        "direction": "REVERSAL",
         "enabled": env_bool("STREAK_C_ENABLED", True),
         "streak": int(os.getenv("STREAK_C_LENGTH", "5")),
         "max_entry_cents": int(os.getenv("STREAK_C_MAX_ENTRY_CENTS", "45")),
@@ -217,6 +220,7 @@ STRATEGY_SLOTS = [
     },
     {
         "name": "D",
+        "direction": "REVERSAL",
         "enabled": env_bool("STREAK_D_ENABLED", True),
         "streak": int(os.getenv("STREAK_D_LENGTH", "4")),
         "max_entry_cents": int(os.getenv("STREAK_D_MAX_ENTRY_CENTS", "27")),
@@ -227,6 +231,7 @@ STRATEGY_SLOTS = [
     },
     {
         "name": "E",
+        "direction": "REVERSAL",
         "enabled": env_bool("STREAK_E_ENABLED", True),
         "streak": int(os.getenv("STREAK_E_LENGTH", "6")),
         "max_entry_cents": int(os.getenv("STREAK_E_MAX_ENTRY_CENTS", "36")),
@@ -235,9 +240,26 @@ STRATEGY_SLOTS = [
         "sizing_mode": os.getenv("STREAK_E_SIZING_MODE", "MANUAL").strip().upper(),
         "bankroll_pct": float(os.getenv("STREAK_E_BANKROLL_PCT", "2.0")),
     },
+    {
+        # S1 continuation: exact one-session streak, same direction as the
+        # immediately prior session, 23c max entry, first minute only.
+        "name": "F",
+        "direction": "CONTINUATION",
+        "enabled": env_bool("STREAK_F_ENABLED", True),
+        "streak": int(os.getenv("STREAK_F_LENGTH", "1")),
+        "max_entry_cents": int(os.getenv("STREAK_F_MAX_ENTRY_CENTS", "23")),
+        "entry_window_minutes": float(os.getenv("STREAK_F_ENTRY_WINDOW_MINUTES", "1")),
+        "contracts": float(os.getenv("STREAK_F_CONTRACTS", "1")),
+        "sizing_mode": os.getenv("STREAK_F_SIZING_MODE", "MANUAL").strip().upper(),
+        "bankroll_pct": float(os.getenv("STREAK_F_BANKROLL_PCT", "2.0")),
+    },
 ]
 
 for slot in STRATEGY_SLOTS:
+    if slot.get("direction") not in {"REVERSAL", "CONTINUATION"}:
+        raise RuntimeError(
+            f'STREAK_{slot["name"]} direction must be REVERSAL or CONTINUATION'
+        )
     if slot["streak"] < 1:
         raise RuntimeError(f'STREAK_{slot["name"]}_LENGTH must be >= 1')
     if not 1 <= slot["max_entry_cents"] <= 99:
@@ -1998,6 +2020,13 @@ def opposite_side(result):
     return "no" if result == "yes" else "yes"
 
 
+def side_for_strategy(strategy, last_result):
+    """Return the side to buy for this slot's directional rule."""
+    if strategy.get("direction") == "CONTINUATION":
+        return last_result
+    return opposite_side(last_result)
+
+
 def market_age_minutes(market):
     """
     Minutes since the actual BTC 15-minute session began.
@@ -3498,6 +3527,7 @@ def main():
         state = "ON" if slot["enabled"] else "OFF"
         print(
             f"SLOT {slot['name']}={state} streak={slot['streak']} "
+            f"direction={slot.get('direction','REVERSAL')} "
             f"max_entry={slot['max_entry_cents']}c "
             f"window={slot['entry_window_minutes']:g}m "
             f"sizing={slot['sizing_mode']} "
@@ -3698,7 +3728,10 @@ def main():
                         f"latest_derived_close={latest_close}; no new entry yet."
                     )
                 elif last_result in {"yes", "no"}:
-                    day_time_ok, day_time_detail = day_time_filter(paper_target_start)
+                    if streak == 1:
+                        day_time_ok, day_time_detail = True, "S1 continuation exempt"
+                    else:
+                        day_time_ok, day_time_detail = day_time_filter(paper_target_start)
                     if not day_time_ok:
                         print(
                             f"DAY/TIME FILTER SKIP (PAPER): {day_time_detail}; "
@@ -3706,8 +3739,10 @@ def main():
                         )
                         matches = []
                     else:
-                        if DAY_TIME_FILTER_ENABLED:
+                        if DAY_TIME_FILTER_ENABLED and streak != 1:
                             print(f"DAY/TIME FILTER PASS (PAPER): {day_time_detail}")
+                        elif streak == 1:
+                            print("DAY/TIME FILTER EXEMPT (PAPER): S1 continuation")
 
                         s2_ok, s2_detail = s2_move_filter(immediate_markets, streak)
                         if not s2_ok:
@@ -3766,7 +3801,7 @@ def main():
                             if utc_now().timestamp() >= expiration_ts:
                                 continue
                             age = market_age_minutes(market)
-                            side = opposite_side(last_result)
+                            side = side_for_strategy(strategy, last_result)
                             limit_cents = float(strategy["max_entry_cents"])
                             contracts = float(strategy["contracts"])
                             ask = entry_ask_cents(market, side)
@@ -4203,7 +4238,10 @@ def main():
                 sleep_idle()
                 continue
 
-            day_time_ok, day_time_detail = day_time_filter(target_start)
+            if streak == 1:
+                day_time_ok, day_time_detail = True, "S1 continuation exempt"
+            else:
+                day_time_ok, day_time_detail = day_time_filter(target_start)
             if not day_time_ok:
                 print(
                     f"DAY/TIME FILTER SKIP: {day_time_detail}; no live order."
@@ -4216,13 +4254,15 @@ def main():
                 sleep_idle()
                 continue
 
-            if DAY_TIME_FILTER_ENABLED:
+            if DAY_TIME_FILTER_ENABLED and streak != 1:
                 print(f"DAY/TIME FILTER PASS: {day_time_detail}")
                 latency_mark(
                     "DAY_TIME_FILTER_PASS",
                     boundary_dt=target_start,
                     detail=day_time_detail,
                 )
+            elif streak == 1:
+                print("DAY/TIME FILTER EXEMPT: S1 continuation")
 
             s2_ok, s2_detail = s2_move_filter(decision_markets, streak)
             if not s2_ok:
@@ -4290,7 +4330,7 @@ def main():
             expiration_ts = (
                 target_start + dt.timedelta(minutes=entry_window)
             ).timestamp()
-            side = opposite_side(last_result)
+            side = side_for_strategy(strategy, last_result)
 
             if utc_now().timestamp() >= expiration_ts:
                 print(
